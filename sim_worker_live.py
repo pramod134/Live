@@ -3,15 +3,13 @@ import asyncio
 import datetime as dt
 import uuid
 import logging
-import json
-import math
 import io
 import sys
+import json
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 import re
-from decimal import Decimal
 
 import httpx
 
@@ -19,7 +17,11 @@ from candle_engine import CandleEngine
 from indicator_bot import IndicatorBot
 from liquidity_pool_builder import print_last_liquidity_output
 from strategy_bos_fvg import print_bos_fvg_final_summaries as print_bos_fvg_htf_final_summaries
-from strategy_bos_fvg_ltf import print_bos_fvg_final_summaries as print_bos_fvg_ltf_final_summaries
+from strategy_bos_fvg_ltf import (
+    print_bos_fvg_final_summaries as print_bos_fvg_ltf_final_summaries,
+    get_live_bridge_rows as get_bos_fvg_ltf_live_bridge_rows,
+    apply_live_bridge_db_state as apply_bos_fvg_ltf_live_bridge_db_state,
+)
 import spot_event as spot_event_module
 
 
@@ -29,7 +31,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [sim_worker] %(message)s",
 )
 logger = logging.getLogger("sim_worker")
-logger.disabled = False  # Keep enabled for simulation diagnostics.
+logger.disabled = True  # Logs disabled; keep strategy logs only
+_BRIDGE_NEW_INSERTED_KEYS: set[str] = set()
+_BRIDGE_ACTIVE_PATCH_LAST: Dict[str, Dict[str, Any]] = {}
 # Silence per-request HTTP client logs such as:
 # "HTTP Request: POST ... \"HTTP/1.1 200 OK\""
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -76,18 +80,7 @@ SIMULATION_RUNS_ALLOWED_COLUMNS = {
 
 def _sanitize_simulation_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only columns that exist in simulation_runs to avoid PostgREST 400 errors."""
-    sanitized = {k: v for k, v in payload.items() if k in SIMULATION_RUNS_ALLOWED_COLUMNS}
-    original_keys = list(payload.keys())
-    sanitized_keys = list(sanitized.keys())
-    dropped_keys = [k for k in original_keys if k not in sanitized]
-    if dropped_keys:
-        logger.warning(
-            "[SIM_RUN_DIAG] sanitize_simulation_runs_payload dropped keys original=%s sanitized=%s dropped=%s",
-            original_keys,
-            sanitized_keys,
-            dropped_keys,
-        )
-    return sanitized
+    return {k: v for k, v in payload.items() if k in SIMULATION_RUNS_ALLOWED_COLUMNS}
 
 
 
@@ -118,130 +111,6 @@ def _load_seed_counts_from_env() -> Dict[str, int]:
 
 
 # ----------------------------- Supabase REST -----------------------------
-
-_DIAG_PREVIEW_MAX = 300
-_DIAG_JSON_PREVIEW_MAX = 4000
-_DIAG_MAX_ISSUES_LOG = 200
-
-
-def _diag_preview(value: Any, limit: int = _DIAG_PREVIEW_MAX) -> str:
-    try:
-        text = repr(value)
-    except Exception as e:
-        text = f"<repr_failed {type(value).__name__}: {e}>"
-    if len(text) > limit:
-        return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
-    return text
-
-
-def _diag_recursive_json_issues(value: Any, path: str = "root") -> list[str]:
-    issues: list[str] = []
-
-    if value is None or isinstance(value, (bool, int, str)):
-        return issues
-
-    if isinstance(value, float):
-        if math.isnan(value):
-            issues.append(f"{path}: non-JSON-safe float NaN")
-        elif math.isinf(value):
-            issues.append(f"{path}: non-JSON-safe float {'+Inf' if value > 0 else '-Inf'}")
-        return issues
-
-    if isinstance(value, Decimal):
-        issues.append(f"{path}: Decimal value detected ({_diag_preview(value, 120)})")
-        return issues
-
-    if isinstance(value, (dt.datetime, dt.date)):
-        issues.append(f"{path}: datetime/date object detected ({type(value).__name__})")
-        return issues
-
-    if isinstance(value, (bytes, bytearray)):
-        issues.append(f"{path}: bytes/bytearray detected")
-        return issues
-
-    if isinstance(value, tuple):
-        issues.append(f"{path}: tuple detected (JSON will coerce to array)")
-        for i, item in enumerate(value):
-            issues.extend(_diag_recursive_json_issues(item, f"{path}[{i}]"))
-        return issues
-
-    if isinstance(value, set):
-        issues.append(f"{path}: set detected (non-JSON-safe)")
-        for i, item in enumerate(sorted(list(value), key=lambda x: repr(x))):
-            issues.extend(_diag_recursive_json_issues(item, f"{path}{{{i}}}"))
-        return issues
-
-    if isinstance(value, list):
-        for i, item in enumerate(value):
-            issues.extend(_diag_recursive_json_issues(item, f"{path}[{i}]"))
-        return issues
-
-    if isinstance(value, dict):
-        for k, v in value.items():
-            if isinstance(k, str):
-                child_path = f"{path}.{k}" if path else k
-            else:
-                child_path = f"{path}.<non_str_key:{type(k).__name__}>"
-                issues.append(
-                    f"{child_path}: dict key is non-string ({_diag_preview(k, 120)})"
-                )
-            issues.extend(_diag_recursive_json_issues(v, child_path))
-        return issues
-
-    issues.append(
-        f"{path}: custom/non-primitive object type={type(value).__name__} preview={_diag_preview(value, 120)}"
-    )
-    return issues
-
-
-def _diag_top_level_type_map(payload: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
-    out: Dict[str, Dict[str, str]] = {}
-    for key, value in payload.items():
-        out[str(key)] = {
-            "type": type(value).__name__,
-            "preview": _diag_preview(value),
-        }
-    return out
-
-
-def _diag_json_dumps_strict(payload: Dict[str, Any], *, context: str) -> Optional[str]:
-    try:
-        return json.dumps(payload, allow_nan=False, default=str)
-    except Exception as e:
-        issues = _diag_recursive_json_issues(payload)
-        issue_count = len(issues)
-        shown = issues[:_DIAG_MAX_ISSUES_LOG]
-        logger.error(
-            "[SIM_RUN_DIAG] strict json serialization failed context=%s error=%s issues_count=%d issues=%s",
-            context,
-            e,
-            issue_count,
-            shown,
-        )
-        if issue_count > _DIAG_MAX_ISSUES_LOG:
-            logger.error(
-                "[SIM_RUN_DIAG] strict json serialization issues truncated context=%s shown=%d total=%d",
-                context,
-                _DIAG_MAX_ISSUES_LOG,
-                issue_count,
-            )
-        return None
-
-
-def _diag_json_preview(payload: Dict[str, Any], *, strict: bool, context: str) -> str:
-    try:
-        text = json.dumps(payload, allow_nan=not strict, default=str)
-    except Exception as e:
-        logger.error(
-            "[SIM_RUN_DIAG] json preview serialization failed context=%s strict=%s error=%s",
-            context,
-            strict,
-            e,
-        )
-        text = _diag_preview(payload, _DIAG_JSON_PREVIEW_MAX)
-    if len(text) > _DIAG_JSON_PREVIEW_MAX:
-        return f"{text[:_DIAG_JSON_PREVIEW_MAX]}...<truncated {len(text) - _DIAG_JSON_PREVIEW_MAX} chars>"
-    return text
 
 def _sb_env() -> tuple[str, str]:
     url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
@@ -285,6 +154,21 @@ async def _sb_select_one(
     return r.json()
 
 
+async def _sb_select(
+    client: httpx.AsyncClient,
+    base_url: str,
+    key: str,
+    table: str,
+    params: Dict[str, str],
+) -> list[Dict[str, Any]]:
+    endpoint = f"{base_url}/rest/v1/{table}"
+    hdrs = _sb_headers(key)
+    r = await client.get(endpoint, headers=hdrs, params=params, timeout=30.0)
+    r.raise_for_status()
+    payload = r.json()
+    return payload if isinstance(payload, list) else []
+
+
 async def _sb_patch(
     client: httpx.AsyncClient,
     base_url: str,
@@ -319,6 +203,235 @@ async def _sb_insert(
     r = await client.post(endpoint, headers=hdrs, json=payload, timeout=30.0)
     r.raise_for_status()
     return r.json() if r.text else None
+
+
+def _tag_value(tags: Any, prefix: str) -> Optional[str]:
+    if not isinstance(tags, list):
+        return None
+    want = f"{prefix}:"
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith(want):
+            return tag.split(":", 1)[1].strip() or None
+    return None
+
+
+def _bridge_match_params_active_trades(row: Dict[str, Any]) -> Dict[str, str]:
+    tags = row.get("tags") if isinstance(row.get("tags"), list) else []
+    setup_id = _tag_value(tags, "id") or str(row.get("setup_id") or "").strip()
+    leg = _tag_value(tags, "leg") or str(row.get("leg") or "").strip()
+    trade = _tag_value(tags, "trade") or str(row.get("trade") or "").strip()
+    return {
+        "select": "id,tags,status",
+        "tags": f"cs.{{\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
+    }
+
+
+def _et_naive_to_utc_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        if not s:
+            return None
+        parsed = dt.datetime.fromisoformat(s)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.ZoneInfo("America/New_York"))
+        return parsed.astimezone(dt.timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _sanitize_bridge_new_trades_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {
+        "symbol",
+        "asset_type",
+        "cp",
+        "qty",
+        "entry_type",
+        "entry_cond",
+        "entry_level",
+        "entry_tf",
+        "sl_type",
+        "sl_cond",
+        "sl_level",
+        "sl_tf",
+        "tp_type",
+        "tp_level",
+        "note",
+        "tags",
+        "trade_type",
+        "end_time",
+        "entry_time",
+        "id",
+    }
+    setup_id = str(payload.get("setup_id") or "").strip()
+    out: Dict[str, Any] = {}
+    if payload.get("end_time_et") is not None:
+        end_time = _et_naive_to_utc_iso(payload.get("end_time_et"))
+        if end_time is not None:
+            out["end_time"] = end_time
+    out["note"] = f"bridge:{setup_id}" if setup_id else "bridge:"
+    out["trade_type"] = "swing"
+    for k in allowed:
+        if k in out:
+            continue
+        if payload.get(k) is not None:
+            out[k] = payload.get(k)
+    return out
+
+
+def _sanitize_bridge_active_trades_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {
+        "sl_level",
+        "manage",
+        "note",
+    }
+    setup_id = str(payload.get("setup_id") or "").strip()
+    out: Dict[str, Any] = {
+        "note": f"bridge:{setup_id}" if setup_id else "bridge:",
+    }
+    for k in allowed:
+        if k in out:
+            continue
+        if payload.get(k) is not None:
+            out[k] = payload.get(k)
+    return out
+
+
+async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> None:
+    rows = get_bos_fvg_ltf_live_bridge_rows()
+    if not rows:
+        return
+    base_url, key = _sb_env()
+    db_state_updates: list[Dict[str, Any]] = []
+    for row in rows:
+        tags = row.get("tags") if isinstance(row.get("tags"), list) else []
+        setup_id = _tag_value(tags, "id") or str(row.get("setup_id") or "").strip()
+        leg = _tag_value(tags, "leg") or str(row.get("leg") or "").strip()
+        trade = _tag_value(tags, "trade") or str(row.get("trade") or "").strip()
+        if not setup_id or leg is None or trade is None:
+            continue
+        row_id = f"{setup_id}:{leg}:{trade}"
+        active_params = {
+            "select": "id,tags,status,manage",
+            "tags": f"cs.{{\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
+        }
+        new_params = {
+            "select": "id,tags",
+            "tags": f"cs.{{\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
+        }
+        new_payload = _sanitize_bridge_new_trades_payload(row)
+        db_new_insert_confirmed = False
+        db_active_seen = False
+        db_active_status = None
+        db_active_manage = None
+
+        try:
+            active_rows = await _sb_select(client, base_url, key, "active_trades", params=active_params)
+        except httpx.HTTPStatusError as e:
+            active_rows = []
+            body = (e.response.text if e.response is not None else str(e))[:240]
+            print(f"[BOS_FVG_BRIDGE][WARN] table=active_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
+        if active_rows:
+            db_active_seen = True
+            db_active_status = "nt-managing" if any(str(r.get("status") or "") == "nt-managing" for r in active_rows) else "nt-waiting"
+            for active_row in active_rows:
+                manage_val = active_row.get("manage")
+                if manage_val is not None:
+                    db_active_manage = manage_val
+                    break
+
+        if row_id in _BRIDGE_NEW_INSERTED_KEYS:
+            db_new_insert_confirmed = True
+        elif db_active_seen:
+            db_new_insert_confirmed = True
+            _BRIDGE_NEW_INSERTED_KEYS.add(row_id)
+        else:
+            try:
+                existing_new_rows = await _sb_select(client, base_url, key, "new_trades", params=new_params)
+            except httpx.HTTPStatusError as e:
+                existing_new_rows = []
+                body = (e.response.text if e.response is not None else str(e))[:240]
+                print(f"[BOS_FVG_BRIDGE][WARN] table=new_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
+            if existing_new_rows:
+                db_new_insert_confirmed = True
+                _BRIDGE_NEW_INSERTED_KEYS.add(row_id)
+            else:
+                try:
+                    print(
+                        f"[BOS_FVG_BRIDGE][DB_WRITE] action=insert table=new_trades "
+                        f"id={setup_id} leg={leg} trade={trade} payload={json.dumps(new_payload, default=str, sort_keys=True)}"
+                    )
+                    await _sb_insert(client, base_url, key, "new_trades", payload=new_payload, returning="minimal")
+                    _BRIDGE_NEW_INSERTED_KEYS.add(row_id)
+                    db_new_insert_confirmed = True
+                    print(f"[BOS_FVG_BRIDGE][DB_APPLIED] action=insert table=new_trades id={setup_id} leg={leg} trade={trade}")
+                except httpx.HTTPStatusError as e:
+                    body = (e.response.text if e.response is not None else str(e))[:240]
+                    print(f"[BOS_FVG_BRIDGE][WARN] table=new_trades id={setup_id} leg={leg} trade={trade} err={body}")
+
+        should_patch_active = False
+        active_patch_payload: Dict[str, Any] = {}
+
+        # Phase 2 (armed): only allow explicit cancel via manage="C"
+        if db_active_seen and str(row.get("manage") or "") == "C":
+            active_patch_payload = _sanitize_bridge_active_trades_payload(
+                {
+                    "manage": "C",
+                    "note": f"bridge:{setup_id}",
+                }
+            )
+            should_patch_active = bool(active_patch_payload)
+
+        # Phase 3 (live): allow live-management fields only when DB says row is live
+        elif db_active_seen and str(db_active_status or "") == "nt-managing":
+            active_patch_payload = _sanitize_bridge_active_trades_payload(
+                {
+                    "manage": row.get("manage"),
+                    "sl_level": row.get("sl_level"),
+                    "note": f"bridge:{setup_id}",
+                }
+            )
+            should_patch_active = bool(active_patch_payload)
+
+        patch_key = f"{setup_id}:{leg}:{trade}"
+        if should_patch_active:
+            last_payload = _BRIDGE_ACTIVE_PATCH_LAST.get(patch_key)
+            if last_payload == active_patch_payload:
+                should_patch_active = False
+
+        if should_patch_active:
+            try:
+                print(
+                    f"[BOS_FVG_BRIDGE][DB_WRITE] action=patch table=active_trades "
+                    f"id={setup_id} leg={leg} trade={trade} payload={json.dumps(active_patch_payload, default=str, sort_keys=True)}"
+                )
+                await _sb_patch(
+                    client,
+                    base_url,
+                    key,
+                    "active_trades",
+                    params=active_params,
+                    payload=active_patch_payload,
+                    returning="minimal",
+                )
+                _BRIDGE_ACTIVE_PATCH_LAST[patch_key] = dict(active_patch_payload)
+                print(f"[BOS_FVG_BRIDGE][DB_APPLIED] action=patch table=active_trades id={setup_id} leg={leg} trade={trade}")
+            except httpx.HTTPStatusError as e:
+                body = (e.response.text if e.response is not None else str(e))[:240]
+                print(f"[BOS_FVG_BRIDGE][WARN] table=active_trades id={setup_id} leg={leg} trade={trade} err={body}")
+        db_state_updates.append(
+            {
+                "setup_id": setup_id,
+                "leg": leg,
+                "trade": trade,
+                "db_new_insert_confirmed": db_new_insert_confirmed,
+                "db_active_seen": db_active_seen,
+                "db_active_status": db_active_status,
+                "db_active_manage": db_active_manage,
+            }
+        )
+    apply_bos_fvg_ltf_live_bridge_db_state(db_state_updates)
 
 
 async def _sb_upload_storage_file(
@@ -523,49 +636,21 @@ def _build_trades_payload(bot: IndicatorBot, symbol: str) -> tuple[Dict[str, Any
     tf_map = bot._sim_strategy_results.get(sym, {}) if hasattr(bot, "_sim_strategy_results") else {}
 
     picked: Optional[Dict[str, Any]] = None
-    picked_key: Optional[str] = None
     for tf in ("1m", "5m", "3m", "15m", "1h", "1d", "1w"):
         result = tf_map.get(tf)
         if isinstance(result, dict):
             picked = result
-            picked_key = tf
             break
     if picked is None:
-        for tf, result in tf_map.items():
+        for result in tf_map.values():
             if isinstance(result, dict):
                 picked = result
-                picked_key = str(tf)
                 break
 
     perf = (picked or {}).get("performance") if isinstance(picked, dict) else {}
     perf = perf if isinstance(perf, dict) else {}
     trade_log = (picked or {}).get("trade_log") if isinstance(picked, dict) else []
     trade_log = trade_log if isinstance(trade_log, list) else []
-    picked_keys = sorted(list((picked or {}).keys())) if isinstance(picked, dict) else []
-    has_trade_summary = isinstance((picked or {}).get("trade_summary"), dict) if isinstance(picked, dict) else False
-    has_trade_list = isinstance((picked or {}).get("trade_list"), list) if isinstance(picked, dict) else False
-    has_performance = isinstance((picked or {}).get("performance"), dict) if isinstance(picked, dict) else False
-    has_trade_log = isinstance((picked or {}).get("trade_log"), list) if isinstance(picked, dict) else False
-    logger.info(
-        "[SIM_RUN_DIAG] trades_payload selection symbol=%s picked_result_key=%s picked_top_keys=%s has_performance=%s has_trade_log=%s has_trade_summary=%s has_trade_list=%s",
-        sym,
-        picked_key,
-        picked_keys,
-        has_performance,
-        has_trade_log,
-        has_trade_summary,
-        has_trade_list,
-    )
-    if not has_performance and has_trade_summary:
-        logger.warning(
-            "[SIM_RUN_DIAG] strategy contract mismatch symbol=%s performance missing but trade_summary exists",
-            sym,
-        )
-    if not has_trade_log and has_trade_list:
-        logger.warning(
-            "[SIM_RUN_DIAG] strategy contract mismatch symbol=%s trade_log missing but trade_list exists",
-            sym,
-        )
 
     trades_summary: Dict[str, Any] = {
         "total_trades": int(perf.get("total_trades", len(trade_log)) or 0),
@@ -638,85 +723,26 @@ async def _create_simulation_run(
         "updated_at": now,
     }
 
-    sanitized_full_payload = _sanitize_simulation_runs_payload(full_payload)
     try:
-        strict_json = _diag_json_dumps_strict(
-            sanitized_full_payload,
-            context=f"create_simulation_run.insert.run_id={run_id}",
-        )
-        issues = _diag_recursive_json_issues(sanitized_full_payload)
-        logger.info(
-            "[SIM_RUN_DIAG] create_simulation_run payload diagnostics run_id=%s original_keys=%s sanitized_keys=%s type_map=%s issues_count=%d strict_json_ok=%s",
-            run_id,
-            list(full_payload.keys()),
-            list(sanitized_full_payload.keys()),
-            _diag_top_level_type_map(sanitized_full_payload),
-            len(issues),
-            strict_json is not None,
-        )
-        if issues:
-            shown = issues[:_DIAG_MAX_ISSUES_LOG]
-            logger.warning(
-                "[SIM_RUN_DIAG] create_simulation_run payload issues run_id=%s issues=%s",
-                run_id,
-                shown,
-            )
-            if len(issues) > _DIAG_MAX_ISSUES_LOG:
-                logger.warning(
-                    "[SIM_RUN_DIAG] create_simulation_run payload issues truncated run_id=%s shown=%d total=%d",
-                    run_id,
-                    _DIAG_MAX_ISSUES_LOG,
-                    len(issues),
-                )
-        logger.info(
-            "[SIM_RUN_DIAG] create_simulation_run focused fields run_id=%s trades_summary_type=%s trades_summary_preview=%s event_counters_type=%s event_counters_preview=%s config_type=%s config_preview=%s",
-            run_id,
-            type(sanitized_full_payload.get('trades_summary')).__name__,
-            _diag_preview(sanitized_full_payload.get('trades_summary')),
-            type(sanitized_full_payload.get('event_counters')).__name__,
-            _diag_preview(sanitized_full_payload.get('event_counters')),
-            type(sanitized_full_payload.get('config')).__name__,
-            _diag_preview(sanitized_full_payload.get('config')),
-        )
         await _sb_insert(
             client,
             base_url,
             key,
             "simulation_runs",
-            payload=sanitized_full_payload,
+            payload=_sanitize_simulation_runs_payload(full_payload),
             returning="minimal",
         )
     except httpx.HTTPStatusError as e:
-        request = e.request
-        response = e.response
-        issues_on_error = _diag_recursive_json_issues(sanitized_full_payload)
-        logger.error(
-            "[SIM_RUN_DIAG] simulation_runs insert failed run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
-            run_id,
-            request.method if request is not None else None,
-            str(request.url) if request is not None else None,
-            response.status_code if response is not None else None,
-            dict(response.headers) if response is not None else None,
-            (response.text[:_DIAG_JSON_PREVIEW_MAX] if response is not None and response.text else ""),
-            _diag_json_preview(
-                sanitized_full_payload,
-                strict=False,
-                context=f"create_simulation_run.insert_error.run_id={run_id}",
-            ),
-            len(issues_on_error),
-            issues_on_error[:_DIAG_MAX_ISSUES_LOG],
-        )
         # Some deployments have a reduced schema and reject one or more JSON columns.
         # Retry with a strict minimal payload so run tracking is still created.
         body = e.response.text[:500] if e.response is not None else str(e)
         logger.warning("full simulation_runs insert failed (retrying minimal payload): %s", body)
-        sanitized_fallback_payload = _sanitize_simulation_runs_payload(fallback_payload)
         await _sb_insert(
             client,
             base_url,
             key,
             "simulation_runs",
-            payload=sanitized_fallback_payload,
+            payload=_sanitize_simulation_runs_payload(fallback_payload),
             returning="minimal",
         )
 
@@ -725,98 +751,20 @@ async def _update_simulation_run(
     client: httpx.AsyncClient,
     run_id: str,
     payload: Dict[str, Any],
-    *,
-    source: str = "unknown",
 ) -> None:
     base_url, key = _sb_env()
     body = dict(payload)
     body["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     sanitized = _sanitize_simulation_runs_payload(body)
-    logger.info(
-        "[SIM_RUN_DIAG] update_simulation_run pre_patch source=%s run_id=%s original_keys=%s sanitized_keys=%s type_map=%s",
-        source,
-        run_id,
-        list(body.keys()),
-        list(sanitized.keys()),
-        _diag_top_level_type_map(sanitized),
+    await _sb_patch(
+        client,
+        base_url,
+        key,
+        "simulation_runs",
+        params={"id": f"eq.{run_id}"},
+        payload=sanitized,
+        returning="minimal",
     )
-    issues = _diag_recursive_json_issues(sanitized)
-    if issues:
-        shown = issues[:_DIAG_MAX_ISSUES_LOG]
-        logger.warning(
-            "[SIM_RUN_DIAG] update_simulation_run json issues source=%s run_id=%s issues=%s",
-            source,
-            run_id,
-            shown,
-        )
-        if len(issues) > _DIAG_MAX_ISSUES_LOG:
-            logger.warning(
-                "[SIM_RUN_DIAG] update_simulation_run json issues truncated source=%s run_id=%s shown=%d total=%d",
-                source,
-                run_id,
-                _DIAG_MAX_ISSUES_LOG,
-                len(issues),
-            )
-    strict_json = _diag_json_dumps_strict(
-        sanitized,
-        context=f"update_simulation_run.patch.run_id={run_id}",
-    )
-    logger.info(
-        "[SIM_RUN_DIAG] update_simulation_run strict_json source=%s run_id=%s ok=%s",
-        source,
-        run_id,
-        strict_json is not None,
-    )
-    logger.info(
-        "[SIM_RUN_DIAG] update_simulation_run focused fields source=%s run_id=%s trades_summary_type=%s trades_summary_preview=%s event_counters_type=%s event_counters_preview=%s config_type=%s config_preview=%s",
-        source,
-        run_id,
-        type(sanitized.get("trades_summary")).__name__,
-        _diag_preview(sanitized.get("trades_summary")),
-        type(sanitized.get("event_counters")).__name__,
-        _diag_preview(sanitized.get("event_counters")),
-        type(sanitized.get("config")).__name__,
-        _diag_preview(sanitized.get("config")),
-    )
-    try:
-        await _sb_patch(
-            client,
-            base_url,
-            key,
-            "simulation_runs",
-            params={"id": f"eq.{run_id}"},
-            payload=sanitized,
-            returning="minimal",
-        )
-    except httpx.HTTPStatusError as e:
-        request = e.request
-        response = e.response
-        logger.error(
-            "[SIM_RUN_DIAG] simulation_runs patch failed source=%s run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
-            source,
-            run_id,
-            request.method if request is not None else None,
-            str(request.url) if request is not None else None,
-            response.status_code if response is not None else None,
-            dict(response.headers) if response is not None else None,
-            (response.text[:_DIAG_JSON_PREVIEW_MAX] if response is not None and response.text else ""),
-            _diag_json_preview(
-                sanitized,
-                strict=False,
-                context=f"update_simulation_run.patch_error.run_id={run_id}",
-            ),
-            len(issues),
-            issues[:_DIAG_MAX_ISSUES_LOG],
-        )
-        if len(issues) > _DIAG_MAX_ISSUES_LOG:
-            logger.error(
-                "[SIM_RUN_DIAG] simulation_runs patch issues truncated source=%s run_id=%s shown=%d total=%d",
-                source,
-                run_id,
-                _DIAG_MAX_ISSUES_LOG,
-                len(issues),
-            )
-        raise
 
 
 async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
@@ -1095,6 +1043,10 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                     }
 
                     await bot.on_candle(symbol=symbol, timeframe=tf, candle=candle)
+                    try:
+                        await _sync_bos_fvg_bridge_rows_to_supabase(client)
+                    except Exception as bridge_err:
+                        logger.warning("bridge sync failed during live loop: %s", bridge_err)
                     emitted_events += 1
 
             # print("[SIM][LIVE] Live sim candle range (UTC):")
@@ -1149,52 +1101,38 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             trades_summary_payload.update(parsed_tf_summaries)
         elif base_trades_summary:
             trades_summary_payload["multi"] = dict(base_trades_summary)
-        logger.info(
-            "[SIM_RUN_DIAG] final trades_summary payload run_id=%s top_level_keys=%s timeframe_previews=%s",
-            run_id,
-            list(trades_summary_payload.keys()),
-            {k: _diag_preview(v) for k, v in trades_summary_payload.items()},
-        )
 
         sim_start_ts = _to_iso_utc((first_live_to_bot or {}).get("ts"))
         sim_end_ts = _to_iso_utc((last_live_to_bot or {}).get("ts"))
         end_time = dt.datetime.now(dt.timezone.utc).isoformat()
-        final_run_payload = {
-            "symbol": symbol,
-            "strategy_name": "SPY_VWAP_Pullback_Scalp_Sim",
-            "strategy_version": "v1.0",
-            "status": "done",
-            "end_time": end_time,
-            "simulation_start_time": sim_start_ts,
-            "simulation_end_time": sim_end_ts,
-            "event_counters": event_counters,
-            "event_candles": event_candles,
-            "trades_summary": trades_summary_payload,
-            "trades": trades,
-            "config": {
-                "symbol": symbol,
-                "seed_date": seed_date,
-                "sim_period": sim_period,
-                "seed_counts": seed_counts,
-            },
-            "error_message": None,
-        }
         try:
-            await _update_simulation_run(
-                client,
-                run_id,
-                payload=final_run_payload,
-                source="final_success_update",
-            )
-        except Exception:
-            logger.exception(
-                "[SIM_RUN_DIAG] first simulation_runs failure happened during final_success_update "
-                "run_id=%s symbol=%s payload_preview=%s",
-                run_id,
-                symbol,
-                _diag_preview(final_run_payload, _DIAG_JSON_PREVIEW_MAX),
-            )
-            raise
+            await _sync_bos_fvg_bridge_rows_to_supabase(client)
+        except Exception as bridge_err:
+            logger.warning("failed to sync BOS_FVG bridge rows to Supabase: %s", bridge_err)
+        await _update_simulation_run(
+            client,
+            run_id,
+            payload={
+                "symbol": symbol,
+                "strategy_name": "SPY_VWAP_Pullback_Scalp_Sim",
+                "strategy_version": "v1.0",
+                "status": "done",
+                "end_time": end_time,
+                "simulation_start_time": sim_start_ts,
+                "simulation_end_time": sim_end_ts,
+                "event_counters": event_counters,
+                "event_candles": event_candles,
+                "trades_summary": trades_summary_payload,
+                "trades": trades,
+                "config": {
+                    "symbol": symbol,
+                    "seed_date": seed_date,
+                    "sim_period": sim_period,
+                    "seed_counts": seed_counts,
+                },
+                "error_message": None,
+            },
+        )
         await _mark_done(client, symbol_db)
         try:
             base_url, key = _sb_env()
@@ -1237,7 +1175,6 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                         "sim_period": sim_period,
                     },
                 },
-                source="error_handler_update",
             )
         except Exception as e3:
             logger.warning("failed to update simulation_runs error payload run_id=%s: %s", run_id, e3)
