@@ -16,8 +16,8 @@ import httpx
 from candle_engine import CandleEngine
 from indicator_bot import IndicatorBot
 from liquidity_pool_builder import print_last_liquidity_output
-from strategy_bos_fvg import print_bos_fvg_final_summaries as print_bos_fvg_htf_final_summaries
 from strategy_bos_fvg_ltf import (
+    print_bos_fvg_final_summaries as print_bos_fvg_htf_final_summaries,
     print_bos_fvg_final_summaries as print_bos_fvg_ltf_final_summaries,
     get_live_bridge_rows as get_bos_fvg_ltf_live_bridge_rows,
     apply_live_bridge_db_state as apply_bos_fvg_ltf_live_bridge_db_state,
