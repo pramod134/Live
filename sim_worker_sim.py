@@ -74,15 +74,15 @@ SIMULATION_RUNS_ALLOWED_COLUMNS = {
 }
 
 
-def _sanitize_simulation_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only columns that exist in simulation_runs to avoid PostgREST 400 errors."""
+def _sanitize_live_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only columns that exist in live_runs to avoid PostgREST 400 errors."""
     sanitized = {k: v for k, v in payload.items() if k in SIMULATION_RUNS_ALLOWED_COLUMNS}
     original_keys = list(payload.keys())
     sanitized_keys = list(sanitized.keys())
     dropped_keys = [k for k in original_keys if k not in sanitized]
     if dropped_keys:
         logger.warning(
-            "[SIM_RUN_DIAG] sanitize_simulation_runs_payload dropped keys original=%s sanitized=%s dropped=%s",
+            "[SIM_RUN_DIAG] sanitize_live_runs_payload dropped keys original=%s sanitized=%s dropped=%s",
             original_keys,
             sanitized_keys,
             dropped_keys,
@@ -638,7 +638,7 @@ async def _create_simulation_run(
         "updated_at": now,
     }
 
-    sanitized_full_payload = _sanitize_simulation_runs_payload(full_payload)
+    sanitized_full_payload = _sanitize_live_runs_payload(full_payload)
     try:
         strict_json = _diag_json_dumps_strict(
             sanitized_full_payload,
@@ -682,7 +682,7 @@ async def _create_simulation_run(
             client,
             base_url,
             key,
-            "simulation_runs",
+            "live_runs",
             payload=sanitized_full_payload,
             returning="minimal",
         )
@@ -691,7 +691,7 @@ async def _create_simulation_run(
         response = e.response
         issues_on_error = _diag_recursive_json_issues(sanitized_full_payload)
         logger.error(
-            "[SIM_RUN_DIAG] simulation_runs insert failed run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
+            "[SIM_RUN_DIAG] live_runs insert failed run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
             run_id,
             request.method if request is not None else None,
             str(request.url) if request is not None else None,
@@ -709,13 +709,13 @@ async def _create_simulation_run(
         # Some deployments have a reduced schema and reject one or more JSON columns.
         # Retry with a strict minimal payload so run tracking is still created.
         body = e.response.text[:500] if e.response is not None else str(e)
-        logger.warning("full simulation_runs insert failed (retrying minimal payload): %s", body)
-        sanitized_fallback_payload = _sanitize_simulation_runs_payload(fallback_payload)
+        logger.warning("full live_runs insert failed (retrying minimal payload): %s", body)
+        sanitized_fallback_payload = _sanitize_live_runs_payload(fallback_payload)
         await _sb_insert(
             client,
             base_url,
             key,
-            "simulation_runs",
+            "live_runs",
             payload=sanitized_fallback_payload,
             returning="minimal",
         )
@@ -731,7 +731,7 @@ async def _update_simulation_run(
     base_url, key = _sb_env()
     body = dict(payload)
     body["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    sanitized = _sanitize_simulation_runs_payload(body)
+    sanitized = _sanitize_live_runs_payload(body)
     logger.info(
         "[SIM_RUN_DIAG] update_simulation_run pre_patch source=%s run_id=%s original_keys=%s sanitized_keys=%s type_map=%s",
         source,
@@ -783,7 +783,7 @@ async def _update_simulation_run(
             client,
             base_url,
             key,
-            "simulation_runs",
+            "live_runs",
             params={"id": f"eq.{run_id}"},
             payload=sanitized,
             returning="minimal",
@@ -792,7 +792,7 @@ async def _update_simulation_run(
         request = e.request
         response = e.response
         logger.error(
-            "[SIM_RUN_DIAG] simulation_runs patch failed source=%s run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
+            "[SIM_RUN_DIAG] live_runs patch failed source=%s run_id=%s method=%s url=%s status=%s headers=%s response_body=%s payload_preview=%s recursive_issues_count=%d recursive_issues=%s",
             source,
             run_id,
             request.method if request is not None else None,
@@ -810,7 +810,7 @@ async def _update_simulation_run(
         )
         if len(issues) > _DIAG_MAX_ISSUES_LOG:
             logger.error(
-                "[SIM_RUN_DIAG] simulation_runs patch issues truncated source=%s run_id=%s shown=%d total=%d",
+                "[SIM_RUN_DIAG] live_runs patch issues truncated source=%s run_id=%s shown=%d total=%d",
                 source,
                 run_id,
                 _DIAG_MAX_ISSUES_LOG,
@@ -821,7 +821,7 @@ async def _update_simulation_run(
 
 async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     """
-    Claim exactly one sim_ticker row where start_sim='y'.
+    Claim exactly one live_ticker row where start_sim='y'.
 
     We do this in 2 steps (read -> patch) because we’re on REST.
     It’s not perfectly atomic like SQL, but it’s good enough for a single-run worker.
@@ -833,7 +833,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={
             "select": "*",
             "start_sim": "eq.y",
@@ -853,7 +853,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol_db}"},
         payload={
             "start_sim": "n",
@@ -869,7 +869,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     # PostgREST returns a list for PATCH with representation
     if isinstance(updated, list):
         if not updated:
-            logger.warning("claim patch matched zero sim_ticker rows for symbol=%s", symbol_db)
+            logger.warning("claim patch matched zero live_ticker rows for symbol=%s", symbol_db)
             return None
         out = dict(updated[0])
     elif isinstance(updated, dict):
@@ -894,7 +894,7 @@ async def _fetch_claimed_job(
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={
             "select": "*",
             "symbol": f"eq.{symbol_db}",
@@ -916,7 +916,7 @@ def _parallel_workers_from_env(job_count: int) -> int:
     Resolve worker concurrency for running claimed jobs.
 
     If SIM_PARALLEL_WORKERS is not set, default to the number of claimed jobs so
-    multiple sim_ticker rows run in parallel without extra configuration.
+    multiple live_ticker rows run in parallel without extra configuration.
     """
     raw = os.getenv("SIM_PARALLEL_WORKERS")
     if raw is None or raw.strip() == "":
@@ -942,7 +942,7 @@ async def _mark_done(client: httpx.AsyncClient, symbol: str) -> None:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol}"},
         payload={"status": "done", "finished_at": now},
         returning="minimal",
@@ -956,7 +956,7 @@ async def _mark_error(client: httpx.AsyncClient, symbol: str, msg: str) -> None:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol}"},
         payload={"status": "error", "error_message": msg[:2000], "finished_at": now},
         returning="minimal",
@@ -998,7 +998,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             sim_period=sim_period,
         )
     except Exception as e:
-        logger.warning("failed to create simulation_runs row for run_id=%s: %s", run_id, e)
+        logger.warning("failed to create live_runs row for run_id=%s: %s", run_id, e)
 
     try:
         with _capture_stdout_to_file(log_local_path):
@@ -1188,7 +1188,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             )
         except Exception:
             logger.exception(
-                "[SIM_RUN_DIAG] first simulation_runs failure happened during final_success_update "
+                "[SIM_RUN_DIAG] first live_runs failure happened during final_success_update "
                 "run_id=%s symbol=%s payload_preview=%s",
                 run_id,
                 symbol,
@@ -1240,7 +1240,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 source="error_handler_update",
             )
         except Exception as e3:
-            logger.warning("failed to update simulation_runs error payload run_id=%s: %s", run_id, e3)
+            logger.warning("failed to update live_runs error payload run_id=%s: %s", run_id, e3)
         try:
             await _mark_error(client, symbol_db or symbol, msg)
         except Exception as e2:
@@ -1294,7 +1294,7 @@ async def main() -> int:
             jobs.append(job)
 
         if not jobs:
-            logger.info("no sim_ticker rows with start_sim='y'; worker exiting")
+            logger.info("no live_ticker rows with start_sim='y'; worker exiting")
             return 0
 
         max_parallel = _parallel_workers_from_env(len(jobs))

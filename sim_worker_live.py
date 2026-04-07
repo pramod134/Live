@@ -78,8 +78,8 @@ SIMULATION_RUNS_ALLOWED_COLUMNS = {
 }
 
 
-def _sanitize_simulation_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep only columns that exist in simulation_runs to avoid PostgREST 400 errors."""
+def _sanitize_live_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only columns that exist in live_runs to avoid PostgREST 400 errors."""
     return {k: v for k, v in payload.items() if k in SIMULATION_RUNS_ALLOWED_COLUMNS}
 
 
@@ -728,21 +728,21 @@ async def _create_simulation_run(
             client,
             base_url,
             key,
-            "simulation_runs",
-            payload=_sanitize_simulation_runs_payload(full_payload),
+            "live_runs",
+            payload=_sanitize_live_runs_payload(full_payload),
             returning="minimal",
         )
     except httpx.HTTPStatusError as e:
         # Some deployments have a reduced schema and reject one or more JSON columns.
         # Retry with a strict minimal payload so run tracking is still created.
         body = e.response.text[:500] if e.response is not None else str(e)
-        logger.warning("full simulation_runs insert failed (retrying minimal payload): %s", body)
+        logger.warning("full live_runs insert failed (retrying minimal payload): %s", body)
         await _sb_insert(
             client,
             base_url,
             key,
-            "simulation_runs",
-            payload=_sanitize_simulation_runs_payload(fallback_payload),
+            "live_runs",
+            payload=_sanitize_live_runs_payload(fallback_payload),
             returning="minimal",
         )
 
@@ -755,12 +755,12 @@ async def _update_simulation_run(
     base_url, key = _sb_env()
     body = dict(payload)
     body["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    sanitized = _sanitize_simulation_runs_payload(body)
+    sanitized = _sanitize_live_runs_payload(body)
     await _sb_patch(
         client,
         base_url,
         key,
-        "simulation_runs",
+        "live_runs",
         params={"id": f"eq.{run_id}"},
         payload=sanitized,
         returning="minimal",
@@ -769,7 +769,7 @@ async def _update_simulation_run(
 
 async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     """
-    Claim exactly one sim_ticker row where start_sim='y'.
+    Claim exactly one live_ticker row where start_sim='y'.
 
     We do this in 2 steps (read -> patch) because we’re on REST.
     It’s not perfectly atomic like SQL, but it’s good enough for a single-run worker.
@@ -781,7 +781,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={
             "select": "*",
             "start_sim": "eq.y",
@@ -801,7 +801,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol_db}"},
         payload={
             "start_sim": "n",
@@ -817,7 +817,7 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     # PostgREST returns a list for PATCH with representation
     if isinstance(updated, list):
         if not updated:
-            logger.warning("claim patch matched zero sim_ticker rows for symbol=%s", symbol_db)
+            logger.warning("claim patch matched zero live_ticker rows for symbol=%s", symbol_db)
             return None
         out = dict(updated[0])
     elif isinstance(updated, dict):
@@ -842,7 +842,7 @@ async def _fetch_claimed_job(
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={
             "select": "*",
             "symbol": f"eq.{symbol_db}",
@@ -864,7 +864,7 @@ def _parallel_workers_from_env(job_count: int) -> int:
     Resolve worker concurrency for running claimed jobs.
 
     If SIM_PARALLEL_WORKERS is not set, default to the number of claimed jobs so
-    multiple sim_ticker rows run in parallel without extra configuration.
+    multiple live_ticker rows run in parallel without extra configuration.
     """
     raw = os.getenv("SIM_PARALLEL_WORKERS")
     if raw is None or raw.strip() == "":
@@ -890,7 +890,7 @@ async def _mark_done(client: httpx.AsyncClient, symbol: str) -> None:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol}"},
         payload={"status": "done", "finished_at": now},
         returning="minimal",
@@ -904,7 +904,7 @@ async def _mark_error(client: httpx.AsyncClient, symbol: str, msg: str) -> None:
         client,
         base_url,
         key,
-        "sim_ticker",
+        "live_ticker",
         params={"symbol": f"eq.{symbol}"},
         payload={"status": "error", "error_message": msg[:2000], "finished_at": now},
         returning="minimal",
@@ -946,7 +946,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             sim_period=sim_period,
         )
     except Exception as e:
-        logger.warning("failed to create simulation_runs row for run_id=%s: %s", run_id, e)
+        logger.warning("failed to create live_runs row for run_id=%s: %s", run_id, e)
 
     try:
         with _capture_stdout_to_file(log_local_path):
@@ -1177,7 +1177,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 },
             )
         except Exception as e3:
-            logger.warning("failed to update simulation_runs error payload run_id=%s: %s", run_id, e3)
+            logger.warning("failed to update live_runs error payload run_id=%s: %s", run_id, e3)
         try:
             await _mark_error(client, symbol_db or symbol, msg)
         except Exception as e2:
@@ -1231,7 +1231,7 @@ async def main() -> int:
             jobs.append(job)
 
         if not jobs:
-            logger.info("no sim_ticker rows with start_sim='y'; worker exiting")
+            logger.info("no live_ticker rows with start_sim='y'; worker exiting")
             return 0
 
         max_parallel = _parallel_workers_from_env(len(jobs))
