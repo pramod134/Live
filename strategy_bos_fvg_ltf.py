@@ -13,6 +13,12 @@ DEBUG_LOGS = str(os.getenv("BOS_FVG_DEBUG_LOGS", "0")).strip().lower() in {"1", 
 ENTRY_LEG_SHARES = 100
 BRIDGE_VERSION = (os.getenv("BOS_FVG_LTF_VERSION") or "v1").strip() or "v1"
 BRIDGE_MANUAL_EOD_CLOSE = str(os.getenv("BOS_FVG_LTF_MANUAL_EOD_CLOSE", "0")).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+_SIM_CHILD_MODE = str(os.getenv("SIM_CHILD_RUN") or "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+_require_confirm_raw = os.getenv("BOS_FVG_LTF_REQUIRE_DB_CONFIRM")
+if _require_confirm_raw is None:
+    BRIDGE_REQUIRE_DB_CONFIRM = not _SIM_CHILD_MODE
+else:
+    BRIDGE_REQUIRE_DB_CONFIRM = str(_require_confirm_raw).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -1022,6 +1028,8 @@ def evaluate_bos_fvg_ltf(
     pending = state["pending_setup"]
     pending_setup_rows = _bridge_setup_rows(state, (pending or {}).get("setup_id"))
     phase1_insert_confirmed = bool(pending_setup_rows) and all(bool(r.get("db_new_insert_confirmed")) for r in pending_setup_rows)
+    if not BRIDGE_REQUIRE_DB_CONFIRM:
+        phase1_insert_confirmed = True
     if pending and pending.get("fvg") and high_px is not None and low_px is not None:
         if not phase1_insert_confirmed:
             status = "pending_setup"
