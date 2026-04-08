@@ -338,6 +338,62 @@ def _log_value(value: Any) -> str:
         return "null"
     return str(value)
 
+
+def _db_state_log(symbol: str, timeframe: str, stage: str, **fields: Any) -> None:
+    parts = [f"[BOS-FVG-DB][STATE] Stage={stage}", f"Symbol={symbol}", f"TF={timeframe}"]
+    for k, v in fields.items():
+        parts.append(f"{k}={_log_value(v)}")
+    print(" | ".join(parts))
+
+
+def _pending_summary(pending: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(pending, dict):
+        return {
+            "pending_exists": False,
+            "trade_id": None,
+            "side": None,
+            "bos_ts": None,
+            "setup_id": None,
+            "has_fvg": False,
+            "cancel_requested": False,
+        }
+    return {
+        "pending_exists": True,
+        "trade_id": pending.get("trade_id"),
+        "side": pending.get("side"),
+        "bos_ts": pending.get("bos_ts"),
+        "setup_id": pending.get("setup_id"),
+        "has_fvg": bool(pending.get("fvg")),
+        "cancel_requested": bool(pending.get("cancel_requested")),
+    }
+
+
+def _rearm_summary(rearm: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(rearm, dict):
+        return {
+            "rearm_exists": False,
+            "rearm_side": None,
+            "rearm_bos_ts": None,
+        }
+    return {
+        "rearm_exists": True,
+        "rearm_side": rearm.get("side"),
+        "rearm_bos_ts": rearm.get("bos_ts"),
+    }
+
+
+def _bridge_counts(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "scope_rows": len(rows),
+        "seen_rows": sum(1 for r in rows if r.get("db_active_seen")),
+        "waiting_rows": sum(1 for r in rows if r.get("db_active_status") == "nt-waiting"),
+        "managing_rows": sum(1 for r in rows if r.get("db_active_status") == "nt-managing"),
+        "manage_c_rows": sum(1 for r in rows if str(r.get("manage") or "") == "C"),
+        "db_manage_c_rows": sum(1 for r in rows if str(r.get("db_active_manage") or "") == "C"),
+        "new_insert_confirmed_rows": sum(1 for r in rows if bool(r.get("db_new_insert_confirmed"))),
+    }
+
+
 def get_live_bridge_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for state in _BOS_FVG_LTF_STATE.values():
@@ -611,6 +667,21 @@ def evaluate_bos_fvg_ltf(
     status = "idle"
     skip_reason = ""
 
+    if DEBUG_LOGS:
+        pending_dbg = _pending_summary(state.get("pending_setup"))
+        rearm_dbg = _rearm_summary(state.get("pending_rearm_setup"))
+        _db_state_log(
+            symbol,
+            timeframe,
+            "eval_start",
+            last_ts=last_ts,
+            chosen_side=chosen_side,
+            chosen_bos_detected=chosen_bos_detected,
+            chosen_score_pass=chosen_score_pass,
+            **pending_dbg,
+            **rearm_dbg,
+        )
+
     # ------------------------------------------------------------
     # Phase 2 cancel-confirmation handling (runs every candle)
     # ------------------------------------------------------------
@@ -625,6 +696,22 @@ def evaluate_bos_fvg_ltf(
         # Only rows that were actually seen in DB matter for confirmation.
         seen_rows = [r for r in setup_rows if r.get("db_active_seen")]
         waiting_rows = [r for r in seen_rows if r.get("db_active_status") == "nt-waiting"]
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "phase2_cancel_check",
+                trade_id=pending.get("trade_id"),
+                setup_id=pending.get("setup_id"),
+                cancel_requested=bool(pending.get("cancel_requested")),
+                setup_rows=len(setup_rows),
+                seen_rows=len(seen_rows),
+                waiting_rows=len(waiting_rows),
+                db_manage_c_waiting=sum(
+                    1 for r in waiting_rows if str(r.get("db_active_manage") or "") == "C"
+                ),
+                bridge_current_setup_id=state.get("bridge_current_setup_id"),
+            )
 
         cancel_confirmed = bool(seen_rows) and all(
             str(r.get("db_active_manage") or "") == "C"
@@ -659,6 +746,20 @@ def evaluate_bos_fvg_ltf(
                 strategy_name="bos_fvg_ltf",
                 version=BRIDGE_VERSION,
             )
+            if DEBUG_LOGS:
+                scope_dbg = _bridge_counts(scope_rows)
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "bos_with_existing_pending",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    pending_side=pending.get("side"),
+                    chosen_side=chosen_side,
+                    has_live_rows=any(r.get("db_active_status") == "nt-managing" for r in scope_rows),
+                    **scope_dbg,
+                    **_rearm_summary(state.get("pending_rearm_setup")),
+                )
             has_live_rows = any(r.get("db_active_status") == "nt-managing" for r in scope_rows)
             if not has_live_rows:
                 state["pending_rearm_setup"] = {
@@ -685,6 +786,16 @@ def evaluate_bos_fvg_ltf(
                     "structure_state_15m": structure_state_15m,
                     "structure_state_1h": structure_state_1h,
                 }
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "pending_rearm_stored",
+                        old_trade_id=pending.get("trade_id"),
+                        old_setup_id=pending.get("setup_id"),
+                        new_side=chosen_side,
+                        new_bos_ts=last_ts,
+                    )
                 waiting_rows = [
                     r for r in scope_rows
                     if r.get("db_active_seen")
@@ -692,11 +803,42 @@ def evaluate_bos_fvg_ltf(
                     and str(r.get("manage") or "") != "C"
                 ]
                 if waiting_rows:
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol,
+                            timeframe,
+                            "phase2_case2_cancel_request",
+                            trade_id=pending.get("trade_id"),
+                            setup_id=pending.get("setup_id"),
+                            waiting_rows=len(waiting_rows),
+                            waiting_leg_trades=",".join(
+                                f"{_safe_int(r.get('leg'), 0)}-{_safe_int(r.get('trade'), 0)}"
+                                for r in waiting_rows
+                            ),
+                        )
                     _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
                     pending["cancel_requested"] = True
+                elif DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "phase2_case2_cancel_skipped_no_waiting_rows",
+                        trade_id=pending.get("trade_id"),
+                        setup_id=pending.get("setup_id"),
+                        **_bridge_counts(scope_rows),
+                    )
                 # Do NOT clear pending_setup here based on the current BOS branch.
                 # Cancel-confirmation is handled every candle above, independent
                 # of whether another BOS happens again.
+            elif DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "rearm_blocked_live_rows_present",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    **_bridge_counts(scope_rows),
+                )
 
         if not state.get("pending_setup"):
             rearm = state.get("pending_rearm_setup")
@@ -761,6 +903,16 @@ def evaluate_bos_fvg_ltf(
                 "cancel_requested": False,
                 "notes": "awaiting_first_same_direction_fvg_after_bos",
             }
+            if DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "pending_setup_published",
+                    trade_id=trade_id,
+                    side=state["pending_setup"].get("side"),
+                    bos_ts=state["pending_setup"].get("bos_ts"),
+                    source="pending_rearm_setup" if rearm else "current_bos",
+                )
             state["pending_rearm_setup"] = None
             if DEBUG_LOGS:
                 print(
@@ -773,6 +925,16 @@ def evaluate_bos_fvg_ltf(
     pending = state["pending_setup"]
     fvg_source = fvgs if isinstance(fvgs, list) else (last_candle.get("fvgs") if isinstance(last_candle.get("fvgs"), list) else [])
     if pending and not pending.get("fvg"):
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "fvg_search_start",
+                trade_id=pending.get("trade_id"),
+                side=pending.get("side"),
+                bos_ts=pending.get("bos_ts"),
+                fvg_pool_size=len(fvg_source or []),
+            )
         bos_dt = _parse_ts(pending.get("bos_ts"))
         fvg = _select_first_post_bos_fvg(fvg_source or [], pending.get("side"), bos_dt)
         if fvg:
@@ -815,8 +977,40 @@ def evaluate_bos_fvg_ltf(
                 _safe_float(fvg.get("high")),
                 _safe_float(fvg.get("low")),
             )
+            if DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "fvg_selected_and_rows_created",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    fvg_ts=pending["fvg"].get("created_ts"),
+                    fvg_low=pending["fvg"].get("low"),
+                    fvg_high=pending["fvg"].get("high"),
+                )
+        elif DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "fvg_search_none",
+                trade_id=pending.get("trade_id"),
+                side=pending.get("side"),
+                bos_ts=pending.get("bos_ts"),
+                fvg_pool_size=len(fvg_source or []),
+            )
     elif pending and pending.get("fvg"):
         pending["fvg"], _ = _refresh_selected_fvg_fields(pending.get("fvg"), fvg_source or [])
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "fvg_refresh_existing",
+                trade_id=pending.get("trade_id"),
+                setup_id=pending.get("setup_id"),
+                fvg_ts=(pending.get("fvg") or {}).get("created_ts"),
+                fvg_filled=bool((pending.get("fvg") or {}).get("filled", False)),
+                trade_score=_safe_float((pending.get("fvg") or {}).get("trade_score")),
+            )
 
     pending = state["pending_setup"]
     pending_setup_rows = _bridge_setup_rows(state, (pending or {}).get("setup_id"))
@@ -824,6 +1018,16 @@ def evaluate_bos_fvg_ltf(
         if pending_setup_rows and not all(bool(r.get("db_new_insert_confirmed")) for r in pending_setup_rows):
             status = "pending_setup"
             skip_reason = "awaiting_new_trades_insert_confirmation"
+            if DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "awaiting_new_trades_insert_confirmation",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    confirmed_rows=sum(1 for r in pending_setup_rows if bool(r.get("db_new_insert_confirmed"))),
+                    total_rows=len(pending_setup_rows),
+                )
 
     bridge_setup_id = state.get("bridge_current_setup_id")
     bridge_rows = _bridge_setup_rows(state, bridge_setup_id)
@@ -863,6 +1067,15 @@ def evaluate_bos_fvg_ltf(
         has_managing = any(r.get("db_active_status") == "nt-managing" for r in bridge_rows)
         has_active = any(bool(r.get("db_active_seen")) for r in bridge_rows)
         live_phase_entered = bool(bridge_setup_meta.get("bridge_live_phase_entered"))
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "bridge_current_setup_status",
+                bridge_current_setup_id=bridge_setup_id,
+                live_phase_entered=live_phase_entered,
+                **_bridge_counts(bridge_rows),
+            )
         if live_phase_entered and has_active and not has_managing:
             cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
             changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
@@ -874,6 +1087,18 @@ def evaluate_bos_fvg_ltf(
         skip_reason = "bos_score_disabled"
     elif state.get("pending_setup"):
         status = "pending_setup"
+
+    if DEBUG_LOGS:
+        _db_state_log(
+            symbol,
+            timeframe,
+            "eval_end",
+            status=status,
+            skip_reason=skip_reason,
+            **_pending_summary(state.get("pending_setup")),
+            **_rearm_summary(state.get("pending_rearm_setup")),
+            bridge_current_setup_id=state.get("bridge_current_setup_id"),
+        )
 
     state["signal_id_counter"] += 1
     signal = {
