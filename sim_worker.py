@@ -16,9 +16,10 @@ import httpx
 from candle_engine import CandleEngine
 from indicator_bot import IndicatorBot
 from liquidity_pool_builder import print_last_liquidity_output
+from strategy_bos_fvg_ltf_sim import (
+    print_bos_fvg_final_summaries as print_bos_fvg_ltf_sim_final_summaries,
+)
 from strategy_bos_fvg_ltf import (
-    print_bos_fvg_final_summaries as print_bos_fvg_htf_final_summaries,
-    print_bos_fvg_final_summaries as print_bos_fvg_ltf_final_summaries,
     get_live_bridge_rows as get_bos_fvg_ltf_live_bridge_rows,
     apply_live_bridge_db_state as apply_bos_fvg_ltf_live_bridge_db_state,
 )
@@ -1084,13 +1085,12 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             except Exception as e:
                 logger.warning("failed to print final liquidity output: %s", e)
 
-            # Print BOS trades once at the end of the simulation.
+            # Print internal-sim BOS/FVG summaries once at the end of the simulation.
+            # Bridge-only module does not emit final trade summaries.
             try:
-                print_bos_fvg_htf_final_summaries()
-                print_bos_fvg_ltf_final_summaries()
+                print_bos_fvg_ltf_sim_final_summaries()
             except Exception as e:
                 logger.warning("failed to print BOS_FVG final summaries: %s", e)
-
             print(f"[SIM_LOG] local log file complete path={log_local_path.as_posix()}")
 
         event_counters, event_candles = _build_event_payloads()
