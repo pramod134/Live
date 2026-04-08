@@ -1,5 +1,5 @@
 from strategy_bos_fvg_ltf import evaluate_bos_fvg_ltf
-from strategy_bos_fvg_ltf_sim import evaluate_bos_score_v1 as evaluate_bos_fvg_ltf_sim
+from strategy_bos_fvg_ltf_sim import evaluate_bos_fvg_ltf as evaluate_bos_fvg_ltf_sim
 from typing import Dict, Any, List, Optional
 
 
