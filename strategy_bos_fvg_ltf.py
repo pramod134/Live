@@ -683,6 +683,34 @@ def evaluate_bos_fvg_ltf(
         )
 
     # ------------------------------------------------------------
+    # Phase 2 -> Phase 3 transition handling (runs every candle)
+    # ------------------------------------------------------------
+    # Once ANY matching active row is nt-managing, this setup is LIVE.
+    # At that point it must no longer remain as a pending/armed setup.
+    pending = state.get("pending_setup")
+    if pending and pending.get("setup_id"):
+        pending_setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
+        pending_live_rows = [r for r in pending_setup_rows if r.get("db_active_status") == "nt-managing"]
+        if pending_live_rows:
+            if DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "phase2_to_phase3_live_detected",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    managing_rows=len(pending_live_rows),
+                    waiting_rows=sum(1 for r in pending_setup_rows if r.get("db_active_status") == "nt-waiting"),
+                )
+            state["pending_setup"] = None
+            state["pending_rearm_setup"] = None
+            setup_meta = (state.get("bridge_setup_index") or {}).get(pending.get("setup_id")) or {}
+            setup_meta["bridge_live_phase_entered"] = True
+            pending = None
+            status = "live"
+            skip_reason = ""
+
+    # ------------------------------------------------------------
     # Phase 2 cancel-confirmation handling (runs every candle)
     # ------------------------------------------------------------
     # If Phase 2 case 2 already requested manage="C" on the current setup,
@@ -842,6 +870,35 @@ def evaluate_bos_fvg_ltf(
 
         if not state.get("pending_setup"):
             rearm = state.get("pending_rearm_setup")
+            # Do not publish a new Phase-1 setup while the current DB-owned setup
+            # is still live or still awaiting Phase-3 cleanup confirmation.
+            bridge_blocks_new_setup = False
+            bridge_block_reason = None
+            current_bridge_setup_id = state.get("bridge_current_setup_id")
+            current_bridge_rows = _bridge_setup_rows(state, current_bridge_setup_id)
+            current_bridge_meta = (state.get("bridge_setup_index") or {}).get(current_bridge_setup_id) or {}
+            if current_bridge_rows:
+                current_has_managing = any(r.get("db_active_status") == "nt-managing" for r in current_bridge_rows)
+                current_waiting_uncancelled = any(
+                    r.get("db_active_seen")
+                    and r.get("db_active_status") == "nt-waiting"
+                    and str(r.get("db_active_manage") or "") != "C"
+                    for r in current_bridge_rows
+                )
+                current_live_phase_entered = bool(current_bridge_meta.get("bridge_live_phase_entered"))
+                if current_has_managing:
+                    bridge_blocks_new_setup = True
+                    bridge_block_reason = "current_setup_live"
+                elif current_live_phase_entered and current_waiting_uncancelled:
+                    bridge_blocks_new_setup = True
+                    bridge_block_reason = "phase3_cleanup_pending"
+            if bridge_blocks_new_setup:
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol, timeframe, "new_setup_blocked_by_current_bridge_setup",
+                        bridge_current_setup_id=current_bridge_setup_id, reason=bridge_block_reason, **_bridge_counts(current_bridge_rows)
+                    )
+                rearm = None
             candidate = rearm or {
                 "side": chosen_side,
                 "bos_ts": last_ts,
@@ -865,61 +922,62 @@ def evaluate_bos_fvg_ltf(
                 "structure_state_tf": structure_state_tf,
                 "structure_state_15m": structure_state_15m,
                 "structure_state_1h": structure_state_1h,
-            }
-            state["trade_id_counter"] += 1
-            trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
-            top_shares = ENTRY_LEG_SHARES
-            bottom_shares = ENTRY_LEG_SHARES
-            total_shares = top_shares + bottom_shares
-            state["pending_setup"] = {
-                "trade_id": trade_id,
-                "side": candidate.get("side"),
-                "bos_ts": candidate.get("bos_ts"),
-                "bos_ts_et": candidate.get("bos_ts_et"),
-                "shares_total": total_shares,
-                "entry_top_shares": top_shares,
-                "entry_bottom_shares": bottom_shares,
-                "entry_ref_swing_high": candidate.get("entry_ref_swing_high"),
-                "entry_ref_swing_high_ts": candidate.get("entry_ref_swing_high_ts"),
-                "entry_ref_swing_high_score": candidate.get("entry_ref_swing_high_score"),
-                "entry_ref_swing_low": candidate.get("entry_ref_swing_low"),
-                "entry_ref_swing_low_ts": candidate.get("entry_ref_swing_low_ts"),
-                "entry_ref_swing_low_score": candidate.get("entry_ref_swing_low_score"),
-                "score_total": candidate.get("score_total"),
-                "score_pass": candidate.get("score_pass"),
-                "momentum_pass": candidate.get("momentum_pass"),
-                "volume_pass": candidate.get("volume_pass"),
-                "close_pass": candidate.get("close_pass"),
-                "break_pass": candidate.get("break_pass"),
-                "mom_value": candidate.get("mom_value"),
-                "vol_value": candidate.get("vol_value"),
-                "close_strength_value": candidate.get("close_strength_value"),
-                "break_distance_value": candidate.get("break_distance_value"),
-                "structure_state_tf": candidate.get("structure_state_tf"),
-                "structure_state_15m": candidate.get("structure_state_15m"),
-                "structure_state_1h": candidate.get("structure_state_1h"),
-                "fvg": None,
-                "setup_id": None,
-                "cancel_requested": False,
-                "notes": "awaiting_first_same_direction_fvg_after_bos",
-            }
-            if DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "pending_setup_published",
-                    trade_id=trade_id,
-                    side=state["pending_setup"].get("side"),
-                    bos_ts=state["pending_setup"].get("bos_ts"),
-                    source="pending_rearm_setup" if rearm else "current_bos",
-                )
-            state["pending_rearm_setup"] = None
-            if DEBUG_LOGS:
-                print(
-                    f"[BOS-FVG-DB] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
-                    f"Side={state['pending_setup'].get('side')} | BOS_TS={state['pending_setup'].get('bos_ts')} | "
-                    f"BOSScore={_safe_float(state['pending_setup'].get('score_total'), 0.0):.2f}"
-                )
+            } if (rearm is not None or not bridge_blocks_new_setup) else None
+            if candidate is not None:
+                state["trade_id_counter"] += 1
+                trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
+                top_shares = ENTRY_LEG_SHARES
+                bottom_shares = ENTRY_LEG_SHARES
+                total_shares = top_shares + bottom_shares
+                state["pending_setup"] = {
+                    "trade_id": trade_id,
+                    "side": candidate.get("side"),
+                    "bos_ts": candidate.get("bos_ts"),
+                    "bos_ts_et": candidate.get("bos_ts_et"),
+                    "shares_total": total_shares,
+                    "entry_top_shares": top_shares,
+                    "entry_bottom_shares": bottom_shares,
+                    "entry_ref_swing_high": candidate.get("entry_ref_swing_high"),
+                    "entry_ref_swing_high_ts": candidate.get("entry_ref_swing_high_ts"),
+                    "entry_ref_swing_high_score": candidate.get("entry_ref_swing_high_score"),
+                    "entry_ref_swing_low": candidate.get("entry_ref_swing_low"),
+                    "entry_ref_swing_low_ts": candidate.get("entry_ref_swing_low_ts"),
+                    "entry_ref_swing_low_score": candidate.get("entry_ref_swing_low_score"),
+                    "score_total": candidate.get("score_total"),
+                    "score_pass": candidate.get("score_pass"),
+                    "momentum_pass": candidate.get("momentum_pass"),
+                    "volume_pass": candidate.get("volume_pass"),
+                    "close_pass": candidate.get("close_pass"),
+                    "break_pass": candidate.get("break_pass"),
+                    "mom_value": candidate.get("mom_value"),
+                    "vol_value": candidate.get("vol_value"),
+                    "close_strength_value": candidate.get("close_strength_value"),
+                    "break_distance_value": candidate.get("break_distance_value"),
+                    "structure_state_tf": candidate.get("structure_state_tf"),
+                    "structure_state_15m": candidate.get("structure_state_15m"),
+                    "structure_state_1h": candidate.get("structure_state_1h"),
+                    "fvg": None,
+                    "setup_id": None,
+                    "cancel_requested": False,
+                    "notes": "awaiting_first_same_direction_fvg_after_bos",
+                }
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "pending_setup_published",
+                        trade_id=trade_id,
+                        side=state["pending_setup"].get("side"),
+                        bos_ts=state["pending_setup"].get("bos_ts"),
+                        source="pending_rearm_setup" if rearm else "current_bos",
+                    )
+                state["pending_rearm_setup"] = None
+                if DEBUG_LOGS:
+                    print(
+                        f"[BOS-FVG-DB] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
+                        f"Side={state['pending_setup'].get('side')} | BOS_TS={state['pending_setup'].get('bos_ts')} | "
+                        f"BOSScore={_safe_float(state['pending_setup'].get('score_total'), 0.0):.2f}"
+                    )
 
     # FVG discovery
     pending = state["pending_setup"]
@@ -1077,6 +1135,26 @@ def evaluate_bos_fvg_ltf(
                 **_bridge_counts(bridge_rows),
             )
         if live_phase_entered and has_active and not has_managing:
+            waiting_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
+            waiting_uncancelled = [r for r in waiting_rows if str(r.get("db_active_manage") or "") != "C"]
+            if not waiting_rows:
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol, timeframe, "phase3_complete_no_rows_remaining",
+                        bridge_current_setup_id=bridge_setup_id
+                    )
+                bridge_setup_meta["bridge_live_phase_entered"] = False
+                if state.get("bridge_current_setup_id") == bridge_setup_id:
+                    state["bridge_current_setup_id"] = None
+            elif not waiting_uncancelled:
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol, timeframe, "phase3_cleanup_confirmed",
+                        bridge_current_setup_id=bridge_setup_id, waiting_rows=len(waiting_rows)
+                    )
+                bridge_setup_meta["bridge_live_phase_entered"] = False
+                if state.get("bridge_current_setup_id") == bridge_setup_id:
+                    state["bridge_current_setup_id"] = None
             cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
             changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
             if changed:
@@ -1085,8 +1163,12 @@ def evaluate_bos_fvg_ltf(
     if not cfg["enabled"]:
         status = "disabled"
         skip_reason = "bos_score_disabled"
+    elif any(r.get("db_active_status") == "nt-managing" for r in bridge_rows):
+        status = "live"
     elif state.get("pending_setup"):
         status = "pending_setup"
+    elif state.get("bridge_current_setup_id") and bool(bridge_setup_meta.get("bridge_live_phase_entered")):
+        status = "live"
 
     if DEBUG_LOGS:
         _db_state_log(
