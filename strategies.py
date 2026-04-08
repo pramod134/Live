@@ -1,4 +1,5 @@
 from strategy_bos_fvg_ltf import evaluate_bos_fvg_ltf
+from strategy_bos_fvg_ltf_sim import evaluate_bos_fvg_ltf as evaluate_bos_fvg_ltf_sim
 from typing import Dict, Any, List, Optional
 
 
@@ -441,7 +442,33 @@ def evaluate_strategies(
     """
     strategies: List[Dict[str, Any]] = []
 
-    # --- BOS+FVG LTF (only active strategy) ---
+    # --- BOS+FVG LTF SIM (internal simulator) ---
+    try:
+        if str(timeframe or "").lower() in {"1m", "3m", "5m"}:
+            bos_ltf_sim = evaluate_bos_fvg_ltf_sim(
+                symbol=symbol,
+                timeframe=timeframe,
+                candles=candles,
+                swings=swings,
+                structure_state_tf=(structure_states_by_tf or {}).get(timeframe),
+                structure_state_15m=(structure_states_by_tf or {}).get("15m"),
+                structure_state_1h=(structure_states_by_tf or {}).get("1h"),
+                fvgs=fvgs,
+                spot_last_candle=spot_last_candle,
+            )
+            if bos_ltf_sim:
+                strategies.append(bos_ltf_sim)
+    except Exception as e:
+        strategies.append(
+            {
+                "id": "bos_fvg_ltf_sim",
+                "timeframe": timeframe,
+                "status": "error",
+                "error": str(e),
+            }
+        )
+
+    # --- BOS+FVG LTF BRIDGE (DB helper / trade-row lifecycle) ---
     try:
         if str(timeframe or "").lower() in {"1m", "3m", "5m"}:
             bos_ltf = evaluate_bos_fvg_ltf(
@@ -449,14 +476,22 @@ def evaluate_strategies(
                 timeframe=timeframe,
                 candles=candles,
                 swings=swings,
+                structure_state_tf=(structure_states_by_tf or {}).get(timeframe),
+                structure_state_15m=(structure_states_by_tf or {}).get("15m"),
+                structure_state_1h=(structure_states_by_tf or {}).get("1h"),
                 fvgs=fvgs,
                 spot_last_candle=spot_last_candle,
             )
             if bos_ltf:
                 strategies.append(bos_ltf)
-    except Exception as exc:
-        print(
-            f"[BOS_FVG_V1] evaluate_strategies failed | Symbol={symbol} | TF={timeframe} | Error={exc}"
+    except Exception as e:
+        strategies.append(
+            {
+                "id": "bos_fvg_ltf",
+                "timeframe": timeframe,
+                "status": "error",
+                "error": str(e),
+            }
         )
 
     return strategies
