@@ -1,6 +1,7 @@
 from strategy_bos_fvg_ltf import evaluate_bos_fvg_ltf
 from strategy_bos_fvg_ltf_sim import evaluate_bos_fvg_ltf as evaluate_bos_fvg_ltf_sim
 from typing import Dict, Any, List, Optional
+import os
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -18,6 +19,26 @@ def _extract_level_price(level: Dict[str, Any]) -> Optional[float]:
         if p is not None:
             return p
     return None
+
+
+def _get_enabled_strategies_from_env() -> Optional[set]:
+    """
+    Parse STRATEGIES_ENABLED env var into a set of strategy ids.
+
+    Expected format:
+      STRATEGIES_ENABLED=bos_fvg_ltf,bos_fvg_ltf_sim
+
+    Returns:
+      - None when unset/empty/"all" (treat as all enabled)
+      - set() when explicitly "none"
+      - Set[str] for explicit allow-list
+    """
+    raw = os.getenv("STRATEGIES_ENABLED", "").strip().lower()
+    if raw in ("", "all"):
+        return None
+    if raw == "none":
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 def _compute_sl_tp(
     direction: str,
@@ -441,10 +462,14 @@ def evaluate_strategies(
     Currently only BOS+FVG Score V1 is enabled.
     """
     strategies: List[Dict[str, Any]] = []
+    enabled = _get_enabled_strategies_from_env()
+
+    def strategy_enabled(strategy_id: str) -> bool:
+        return enabled is None or strategy_id in enabled
 
     # --- BOS+FVG LTF SIM (internal simulator) ---
     try:
-        if str(timeframe or "").lower() in {"1m", "3m", "5m"}:
+        if strategy_enabled("bos_fvg_ltf_sim") and str(timeframe or "").lower() in {"1m", "3m", "5m"}:
             bos_ltf_sim = evaluate_bos_fvg_ltf_sim(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -470,7 +495,7 @@ def evaluate_strategies(
 
     # --- BOS+FVG LTF BRIDGE (DB helper / trade-row lifecycle) ---
     try:
-        if str(timeframe or "").lower() in {"1m", "3m", "5m"}:
+        if strategy_enabled("bos_fvg_ltf") and str(timeframe or "").lower() in {"1m", "3m", "5m"}:
             bos_ltf = evaluate_bos_fvg_ltf(
                 symbol=symbol,
                 timeframe=timeframe,
