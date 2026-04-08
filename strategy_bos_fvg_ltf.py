@@ -43,7 +43,7 @@ def _safe_bool_env(name: str, default: bool) -> bool:
     if val in {"0", "false", "f", "no", "n", "off"}:
         return False
     if DEBUG_LOGS:
-        print(f"[BOS_FVG_V1] env fallback used for {name}: {raw!r}")
+        print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
     return default
 
 
@@ -54,7 +54,7 @@ def _safe_float_env(name: str, default: float) -> float:
     val = _safe_float(raw)
     if val is None:
         if DEBUG_LOGS:
-            print(f"[BOS_FVG_V1] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
         return default
     return val
 
@@ -67,7 +67,7 @@ def _safe_int_env(name: str, default: int) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         if DEBUG_LOGS:
-            print(f"[BOS_FVG_V1] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
         return default
 
 
@@ -204,7 +204,7 @@ def _bridge_trade_log(action: str, row: Dict[str, Any], reason: str) -> None:
                 setup_id = tag.split(":", 1)[1]
                 break
     print(
-        f"[BOS_FVG_V1][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
+        f"[BOS-FVG-DB][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
         f"ID={setup_id} | Leg={row.get('leg')} | Trade={row.get('trade')} | Entry={row.get('entry_level')} | "
         f"SL={row.get('sl_level')} | Status={row.get('status')} | Manage={row.get('manage')} | Reason={reason}"
     )
@@ -564,10 +564,10 @@ def evaluate_bos_fvg_ltf(
 
     if long_bos_detected and swing_high_key:
         state["broken_swing_highs"].add(swing_high_key)
-        print(f"[BOS_FVG_V1] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
+        print(f"[BOS-FVG-DB] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
     if short_bos_detected and swing_low_key:
         state["broken_swing_lows"].add(swing_low_key)
-        print(f"[BOS_FVG_V1] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
+        print(f"[BOS-FVG-DB] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
 
     chosen_side = "none"
     chosen_bos_detected = False
@@ -639,7 +639,7 @@ def evaluate_bos_fvg_ltf(
         if cancel_confirmed:
             if DEBUG_LOGS:
                 print(
-                    f"[BOS_FVG_V1] phase2 cancel confirmed | Symbol={symbol} | TF={timeframe} | "
+                    f"[BOS-FVG-DB] phase2 cancel confirmed | Symbol={symbol} | TF={timeframe} | "
                     f"TradeID={pending.get('trade_id')} | SetupID={pending.get('setup_id')}"
                 )
             state["pending_setup"] = None
@@ -764,7 +764,7 @@ def evaluate_bos_fvg_ltf(
             state["pending_rearm_setup"] = None
             if DEBUG_LOGS:
                 print(
-                    f"[BOS_FVG_V1] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
+                    f"[BOS-FVG-DB] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
                     f"Side={state['pending_setup'].get('side')} | BOS_TS={state['pending_setup'].get('bos_ts')} | "
                     f"BOSScore={_safe_float(state['pending_setup'].get('score_total'), 0.0):.2f}"
                 )
@@ -790,7 +790,7 @@ def evaluate_bos_fvg_ltf(
                 "trade_score_src": trade_score_src,
             }
             print(
-                f"[BOS_FVG_V1] FVG selected | Symbol={symbol} | TF={timeframe} | TradeID={pending.get('trade_id')} | "
+                f"[BOS-FVG-DB] FVG selected | Symbol={symbol} | TF={timeframe} | TradeID={pending.get('trade_id')} | "
                 f"Side={pending.get('side')} | FVG_TS={fvg.get('created_ts')} | Low={_safe_float(fvg.get('low'))} | High={_safe_float(fvg.get('high'))} | "
                 f"FVGScore={fvg_score} | TradeScore={trade_score} | FVGScoreSrc={fvg_score_src} | TradeScoreSrc={trade_score_src} | "
                 f"FVG={json.dumps(fvg, default=str, sort_keys=True)}"
