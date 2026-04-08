@@ -611,6 +611,43 @@ def evaluate_bos_fvg_ltf(
     status = "idle"
     skip_reason = ""
 
+    # ------------------------------------------------------------
+    # Phase 2 cancel-confirmation handling (runs every candle)
+    # ------------------------------------------------------------
+    # If Phase 2 case 2 already requested manage="C" on the current setup,
+    # do NOT wait for rows to be removed. Only wait for DB-fed confirmation
+    # that the waiting rows for this setup have db_active_manage == "C".
+    # Once confirmed, clear the old setup so the orchestrator can move back
+    # to Phase 1 and allow the rearm candidate to become the new pending setup.
+    pending = state.get("pending_setup")
+    if pending and bool(pending.get("cancel_requested")) and pending.get("setup_id"):
+        setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
+        # Only rows that were actually seen in DB matter for confirmation.
+        seen_rows = [r for r in setup_rows if r.get("db_active_seen")]
+        waiting_rows = [r for r in seen_rows if r.get("db_active_status") == "nt-waiting"]
+
+        cancel_confirmed = bool(seen_rows) and all(
+            str(r.get("db_active_manage") or "") == "C"
+            for r in waiting_rows
+        )
+
+        # If rows were seen previously and are no longer waiting, also treat that
+        # as confirmed enough to release the setup. We do NOT wait for deletion.
+        if seen_rows and not waiting_rows:
+            cancel_confirmed = True
+
+        if cancel_confirmed:
+            if DEBUG_LOGS:
+                print(
+                    f"[BOS_FVG_V1] phase2 cancel confirmed | Symbol={symbol} | TF={timeframe} | "
+                    f"TradeID={pending.get('trade_id')} | SetupID={pending.get('setup_id')}"
+                )
+            state["pending_setup"] = None
+            # Release current bridge pointer so the next setup becomes current.
+            if state.get("bridge_current_setup_id") == pending.get("setup_id"):
+                state["bridge_current_setup_id"] = None
+            pending = None
+
     # Setup state management
     if cfg["enabled"] and chosen_bos_detected and chosen_score_pass and cfg["max_open_positions"] >= 1:
         pending = state["pending_setup"]
@@ -656,21 +693,10 @@ def evaluate_bos_fvg_ltf(
                 ]
                 if waiting_rows:
                     _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
-                # Do not publish a new setup until ALL armed rows in this strategy/version/symbol/tf
-                # scope have been DB-confirmed as canceled (or disappeared).
-                scope_waiting_after = [
-                    r for r in _bridge_scope_rows(
-                        state,
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        strategy_name="bos_fvg_ltf",
-                        version=BRIDGE_VERSION,
-                    )
-                    if r.get("db_active_seen") and r.get("db_active_status") == "nt-waiting"
-                ]
-                cancel_confirmed = all(str(r.get("db_active_manage") or "") == "C" for r in scope_waiting_after)
-                if cancel_confirmed and scope_waiting_after:
-                    state["pending_setup"] = None
+                    pending["cancel_requested"] = True
+                # Do NOT clear pending_setup here based on the current BOS branch.
+                # Cancel-confirmation is handled every candle above, independent
+                # of whether another BOS happens again.
 
         if not state.get("pending_setup"):
             rearm = state.get("pending_rearm_setup")
@@ -732,6 +758,7 @@ def evaluate_bos_fvg_ltf(
                 "structure_state_1h": candidate.get("structure_state_1h"),
                 "fvg": None,
                 "setup_id": None,
+                "cancel_requested": False,
                 "notes": "awaiting_first_same_direction_fvg_after_bos",
             }
             state["pending_rearm_setup"] = None
