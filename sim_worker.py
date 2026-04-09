@@ -12,8 +12,9 @@ from typing import Any, Dict, Optional
 import re
 
 import httpx
+from zoneinfo import ZoneInfo
 
-from candle_engine import CandleEngine
+from candle_engine import CandleEngine, is_rth_now
 from indicator_bot import IndicatorBot
 from liquidity_pool_builder import print_last_liquidity_output
 from strategy_bos_fvg_ltf_sim import (
@@ -22,6 +23,7 @@ from strategy_bos_fvg_ltf_sim import (
 from strategy_bos_fvg_ltf import (
     get_live_bridge_rows as get_bos_fvg_ltf_live_bridge_rows,
     apply_live_bridge_db_state as apply_bos_fvg_ltf_live_bridge_db_state,
+    set_bridge_runtime_mode as set_bos_fvg_ltf_runtime_mode,
 )
 import spot_event as spot_event_module
 
@@ -39,6 +41,7 @@ _BRIDGE_ACTIVE_PATCH_LAST: Dict[str, Dict[str, Any]] = {}
 # "HTTP Request: POST ... \"HTTP/1.1 200 OK\""
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+EASTERN = ZoneInfo("America/New_York")
 
 DEFAULT_SEED_COUNTS = {
     "1m": 5000,
@@ -82,6 +85,179 @@ SIMULATION_RUNS_ALLOWED_COLUMNS = {
 def _sanitize_live_runs_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only columns that exist in live_runs to avoid PostgREST 400 errors."""
     return {k: v for k, v in payload.items() if k in SIMULATION_RUNS_ALLOWED_COLUMNS}
+
+
+def _parse_iso_dt(value: Any) -> Optional[dt.datetime]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, dt.datetime):
+            out = value
+        else:
+            out = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if out.tzinfo is None:
+            out = out.replace(tzinfo=dt.timezone.utc)
+        return out.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _iso_utc(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc).isoformat()
+
+
+def _poll_sleep_seconds() -> float:
+    raw = (os.getenv("SIM_LIVE_POLL_SECONDS") or "").strip()
+    if not raw:
+        return 1.0
+    try:
+        out = float(raw)
+        return 0.2 if out <= 0 else out
+    except Exception:
+        return 1.0
+
+
+async def _fetch_latest_rth_1m_ts(engine: CandleEngine, symbol: str) -> Optional[dt.datetime]:
+    rows = await engine._sb_fetch_candles(
+        table="candle_history_1m",
+        symbol=symbol,
+        session_eq="rth",
+        limit=1,
+        order_asc=False,
+    )
+    if not rows:
+        return None
+    return _parse_iso_dt(rows[0].get("ts"))
+
+
+async def _fetch_new_rth_1m_rows(
+    engine: CandleEngine,
+    symbol: str,
+    after_ts: Optional[dt.datetime],
+    upto_ts: Optional[dt.datetime] = None,
+    limit: int = 5000,
+) -> list[Dict[str, Any]]:
+    ts_gte = None
+    if after_ts is not None:
+        ts_gte = _iso_utc(after_ts + dt.timedelta(microseconds=1))
+    ts_lte = _iso_utc(upto_ts) if upto_ts is not None else None
+    return await engine._sb_fetch_candles(
+        table="candle_history_1m",
+        symbol=symbol,
+        ts_gte=ts_gte,
+        ts_lte=ts_lte,
+        session_eq="rth",
+        limit=limit,
+        order_asc=True,
+    )
+
+
+async def _process_rth_1m_rows(
+    *,
+    engine: CandleEngine,
+    bot: IndicatorBot,
+    client: httpx.AsyncClient,
+    symbol: str,
+    rows_1m: list[Dict[str, Any]],
+    bridge_sync_enabled: bool,
+    first_live_ts: Dict[str, str],
+    last_live_ts: Dict[str, str],
+    first_live_to_bot: Optional[Dict[str, Any]],
+    last_live_to_bot: Optional[Dict[str, Any]],
+) -> tuple[Optional[dt.datetime], Optional[Dict[str, Any]], Optional[Dict[str, Any]], int]:
+    sym = symbol.upper()
+    emitted_events = 0
+    last_processed_ts: Optional[dt.datetime] = None
+
+    engine.candles.setdefault(sym, {})
+    engine.latest_ts.setdefault(sym, {})
+    engine.candles[sym].setdefault("1m", [])
+    engine.latest_ts[sym].setdefault("1m", None)
+    for tf in ("3m", "5m", "15m", "1h"):
+        engine.candles[sym].setdefault(tf, [])
+        engine.latest_ts[sym].setdefault(tf, None)
+
+    def _norm_db_row(r: Dict[str, Any]) -> Dict[str, Any]:
+        out_r = dict(r)
+        ts_utc = CandleEngine._parse_ts_utc(out_r.get("ts"))
+        out_r["ts"] = ts_utc.isoformat()
+        if out_r.get("open") is not None:
+            out_r["open"] = float(out_r["open"])
+        if out_r.get("high") is not None:
+            out_r["high"] = float(out_r["high"])
+        if out_r.get("low") is not None:
+            out_r["low"] = float(out_r["low"])
+        if out_r.get("close") is not None:
+            out_r["close"] = float(out_r["close"])
+        if "volume" in out_r:
+            out_r["volume"] = float(out_r.get("volume") or 0.0)
+        if out_r.get("vwap") is not None:
+            out_r["vwap"] = float(out_r["vwap"])
+        if out_r.get("trade_count") is not None:
+            try:
+                out_r["trade_count"] = int(out_r["trade_count"])
+            except Exception:
+                pass
+        out_r["symbol"] = sym
+        return out_r
+
+    def _record_event(tf: str, candle: Dict[str, Any]) -> None:
+        nonlocal emitted_events, first_live_to_bot, last_live_to_bot
+        emitted_events += 1
+        ts_str = str(candle.get("ts"))
+        if tf not in first_live_ts:
+            first_live_ts[tf] = ts_str
+        last_live_ts[tf] = ts_str
+
+        if first_live_to_bot is None:
+            first_live_to_bot = {
+                "tf": tf,
+                "ts": candle.get("ts"),
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+            }
+        last_live_to_bot = {
+            "tf": tf,
+            "ts": candle.get("ts"),
+            "open": candle.get("open"),
+            "high": candle.get("high"),
+            "low": candle.get("low"),
+            "close": candle.get("close"),
+            "volume": candle.get("volume"),
+        }
+
+    for r in rows_1m:
+        raw_1m = _norm_db_row(r)
+        e_1m = engine._enrich_candle(sym, "1m", raw_1m)
+        if e_1m.get("session") != "rth":
+            continue
+        engine.candles[sym]["1m"].append(e_1m)
+        ts_dt = _parse_iso_dt(e_1m.get("ts"))
+        engine.latest_ts[sym]["1m"] = ts_dt
+        engine.sim_clock_ts = ts_dt
+        last_processed_ts = ts_dt
+
+        _record_event("1m", e_1m)
+        await bot.on_candle(symbol=symbol, timeframe="1m", candle=e_1m)
+
+        for tf in ("3m", "5m", "15m", "1h"):
+            new_htf = engine._aggregate_from_1m(sym, tf, [e_1m])
+            for c in new_htf:
+                _record_event(tf, c)
+                await bot.on_candle(symbol=symbol, timeframe=tf, candle=c)
+
+        if bridge_sync_enabled:
+            try:
+                await _sync_bos_fvg_bridge_rows_to_supabase(client)
+            except Exception as bridge_err:
+                logger.warning("bridge sync failed during live loop: %s", bridge_err)
+
+    return last_processed_ts, first_live_to_bot, last_live_to_bot, emitted_events
 
 
 
@@ -236,7 +412,7 @@ def _et_naive_to_utc_iso(value: Any) -> Optional[str]:
             return None
         parsed = dt.datetime.fromisoformat(s)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.ZoneInfo("America/New_York"))
+            parsed = parsed.replace(tzinfo=EASTERN)
         return parsed.astimezone(dt.timezone.utc).isoformat()
     except Exception:
         return None
@@ -990,65 +1166,128 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 last_ts = _ts_str(arr[-1].get("ts"))
                 # print(f"[SIM][SEED] {symbol} {tf}: n={n} first_ts={first_ts} last_ts={last_ts}")
 
-            # Run sim day-by-day starting next trading day 09:30 ET
-            sim_days = await engine.get_sim_days(symbol=symbol, start_after_seed_date_et=seed_date, num_days=sim_period)
-            # print(f"[SIM_WORKER] Sim days: {sim_days[:3]}{'...' if len(sim_days) > 3 else ''}")
-
-            # ---------------- LIVE SIM LOGS ----------------
             first_live_ts: Dict[str, str] = {}
             last_live_ts: Dict[str, str] = {}
-
             first_live_to_bot: Optional[Dict[str, Any]] = None
             last_live_to_bot: Optional[Dict[str, Any]] = None
             emitted_events = 0
+            poll_sleep_s = _poll_sleep_seconds()
+            last_processed_ts = engine.latest_ts.get(symbol, {}).get("1m")
 
-            for d in sim_days:
-                # IMPORTANT: stream_day() now behaves like live:
-                # - reads ONLY 1m from DB
-                # - enriches 1m via CandleEngine._enrich_candle()
-                # - aggregates 3m/5m/15m/1h from 1m via _aggregate_from_1m()
-                # - emits closed candles for those HTFs
-                async for event in engine.stream_day(symbol=symbol, date_et=d):
-                    # event = {"tf": "1m"/"3m"/..., "candle": enriched {...}}
-                    tf = event["tf"]
-                    candle = event["candle"]
+            # ------------------------------------------------------------
+            # Phase 1: catch-up
+            # - track indicators / setups
+            # - DO NOT materialize bridge rows
+            # - DO NOT sync bridge rows to DB
+            # ------------------------------------------------------------
+            set_bos_fvg_ltf_runtime_mode(execution_enabled=False, live_mode=False)
+            catchup_cutoff_ts = await _fetch_latest_rth_1m_ts(engine, symbol)
+            if catchup_cutoff_ts and (last_processed_ts is None or catchup_cutoff_ts > last_processed_ts):
+                print(
+                    f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
+                    f"seed_last_ts={_ts_str(last_processed_ts)} | catchup_cutoff_ts={_ts_str(catchup_cutoff_ts)}"
+                )
+                while True:
+                    catchup_rows = await _fetch_new_rth_1m_rows(
+                        engine=engine,
+                        symbol=symbol,
+                        after_ts=last_processed_ts,
+                        upto_ts=catchup_cutoff_ts,
+                        limit=5000,
+                    )
+                    if not catchup_rows:
+                        break
+                    processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
+                        engine=engine,
+                        bot=bot,
+                        client=client,
+                        symbol=symbol,
+                        rows_1m=catchup_rows,
+                        bridge_sync_enabled=False,
+                        first_live_ts=first_live_ts,
+                        last_live_ts=last_live_ts,
+                        first_live_to_bot=first_live_to_bot,
+                        last_live_to_bot=last_live_to_bot,
+                    )
+                    emitted_events += processed_events
+                    if processed_ts is None:
+                        break
+                    last_processed_ts = processed_ts
+                    if last_processed_ts >= catchup_cutoff_ts:
+                        break
+                print(
+                    f"[SIM_WORKER] catchup_done | Symbol={symbol} | "
+                    f"last_processed_ts={_ts_str(last_processed_ts)}"
+                )
+            else:
+                print(
+                    f"[SIM_WORKER] catchup_skipped | Symbol={symbol} | "
+                    f"seed_last_ts={_ts_str(last_processed_ts)}"
+                )
+
+            # ------------------------------------------------------------
+            # Phase 2: continuous live loop
+            # - preserve setup state built during catch-up
+            # - allow first live candle to materialize pending setup
+            # - sync bridge rows to DB
+            # ------------------------------------------------------------
+            set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
+            print(
+                f"[SIM_WORKER] live_loop_start | Symbol={symbol} | "
+                f"after_ts={_ts_str(last_processed_ts)} | poll_s={poll_sleep_s}"
+            )
+
+            while True:
+                if not is_rth_now():
+                    await asyncio.sleep(max(5.0, poll_sleep_s))
+                    continue
+
+                live_rows = await _fetch_new_rth_1m_rows(
+                    engine=engine,
+                    symbol=symbol,
+                    after_ts=last_processed_ts,
+                    upto_ts=None,
+                    limit=5000,
+                )
+                if not live_rows:
+                    await asyncio.sleep(poll_sleep_s)
+                    continue
+
+                processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
+                    engine=engine,
+                    bot=bot,
+                    client=client,
+                    symbol=symbol,
+                    rows_1m=live_rows,
+                    bridge_sync_enabled=True,
+                    first_live_ts=first_live_ts,
+                    last_live_ts=last_live_ts,
+                    first_live_to_bot=first_live_to_bot,
+                    last_live_to_bot=last_live_to_bot,
+                )
+                emitted_events += processed_events
+                if processed_ts is not None:
+                    last_processed_ts = processed_ts
                     try:
-                        tf_s = str(tf or "")
-                        ts = _ts_str(candle.get("ts"))
-                        if tf_s and tf_s not in first_live_ts:
-                            first_live_ts[tf_s] = ts
-                        if tf_s:
-                            last_live_ts[tf_s] = ts
-                    except Exception:
-                        pass
-
-                    if first_live_to_bot is None:
-                        first_live_to_bot = {
-                            "tf": tf,
-                            "ts": candle.get("ts"),
-                            "open": candle.get("open"),
-                            "high": candle.get("high"),
-                            "low": candle.get("low"),
-                            "close": candle.get("close"),
-                            "volume": candle.get("volume"),
-                        }
-
-                    last_live_to_bot = {
-                        "tf": tf,
-                        "ts": candle.get("ts"),
-                        "open": candle.get("open"),
-                        "high": candle.get("high"),
-                        "low": candle.get("low"),
-                        "close": candle.get("close"),
-                        "volume": candle.get("volume"),
-                    }
-
-                    await bot.on_candle(symbol=symbol, timeframe=tf, candle=candle)
-                    try:
-                        await _sync_bos_fvg_bridge_rows_to_supabase(client)
-                    except Exception as bridge_err:
-                        logger.warning("bridge sync failed during live loop: %s", bridge_err)
-                    emitted_events += 1
+                        await _update_simulation_run(
+                            client,
+                            run_id,
+                            payload={
+                                "status": "running",
+                                "simulation_start_time": _to_iso_utc((first_live_to_bot or {}).get("ts")),
+                                "simulation_end_time": _to_iso_utc((last_live_to_bot or {}).get("ts")),
+                                "config": {
+                                    "symbol": symbol,
+                                    "seed_date": seed_date,
+                                    "sim_period": sim_period,
+                                    "seed_counts": seed_counts,
+                                    "mode": "catchup_then_live_poll",
+                                    "last_processed_ts": _to_iso_utc(last_processed_ts),
+                                },
+                            },
+                        )
+                    except Exception as hb_err:
+                        logger.warning("failed to update running heartbeat for %s: %s", symbol, hb_err)
 
             # print("[SIM][LIVE] Live sim candle range (UTC):")
             for tf in sorted(last_live_ts.keys(), key=lambda s: (len(s), s)):
@@ -1093,48 +1332,44 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 logger.warning("failed to print BOS_FVG final summaries: %s", e)
             print(f"[SIM_LOG] local log file complete path={log_local_path.as_posix()}")
 
-        event_counters, event_candles = _build_event_payloads()
-        parsed_tf_summaries = _parse_final_summary_lines(log_local_path)
-        base_trades_summary, trades = _build_trades_payload(bot, symbol)
-        trades_summary_payload: Dict[str, Any] = {}
-        if parsed_tf_summaries:
-            trades_summary_payload.update(parsed_tf_summaries)
-        elif base_trades_summary:
-            trades_summary_payload["multi"] = dict(base_trades_summary)
-
-        sim_start_ts = _to_iso_utc((first_live_to_bot or {}).get("ts"))
-        sim_end_ts = _to_iso_utc((last_live_to_bot or {}).get("ts"))
-        end_time = dt.datetime.now(dt.timezone.utc).isoformat()
+    except asyncio.CancelledError:
+        logger.info("simulation cancelled for symbol=%s", symbol)
+        msg = "cancelled"
         try:
-            await _sync_bos_fvg_bridge_rows_to_supabase(client)
-        except Exception as bridge_err:
-            logger.warning("failed to sync BOS_FVG bridge rows to Supabase: %s", bridge_err)
-        await _update_simulation_run(
-            client,
-            run_id,
-            payload={
-                "symbol": symbol,
-                "strategy_name": "SPY_VWAP_Pullback_Scalp_Sim",
-                "strategy_version": "v1.0",
-                "status": "done",
-                "end_time": end_time,
-                "simulation_start_time": sim_start_ts,
-                "simulation_end_time": sim_end_ts,
-                "event_counters": event_counters,
-                "event_candles": event_candles,
-                "trades_summary": trades_summary_payload,
-                "trades": trades,
-                "config": {
+            event_counters, event_candles = _build_event_payloads()
+            parsed_tf_summaries = _parse_final_summary_lines(log_local_path)
+            base_trades_summary, trades = _build_trades_payload(bot, symbol)
+            trades_summary_payload: Dict[str, Any] = {}
+            if parsed_tf_summaries:
+                trades_summary_payload.update(parsed_tf_summaries)
+            elif base_trades_summary:
+                trades_summary_payload["multi"] = dict(base_trades_summary)
+            await _update_simulation_run(
+                client,
+                run_id,
+                payload={
                     "symbol": symbol,
-                    "seed_date": seed_date,
-                    "sim_period": sim_period,
-                    "seed_counts": seed_counts,
+                    "strategy_name": "SPY_VWAP_Pullback_Scalp_Sim",
+                    "strategy_version": "v1.0",
+                    "status": "done",
+                    "end_time": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "simulation_start_time": _to_iso_utc((first_live_to_bot or {}).get("ts")),
+                    "simulation_end_time": _to_iso_utc((last_live_to_bot or {}).get("ts")),
+                    "event_counters": event_counters,
+                    "event_candles": event_candles,
+                    "trades_summary": trades_summary_payload,
+                    "trades": trades,
+                    "config": {
+                        "symbol": symbol,
+                        "seed_date": seed_date,
+                        "sim_period": sim_period,
+                        "seed_counts": seed_counts,
+                        "mode": "catchup_then_live_poll",
+                    },
+                    "error_message": None,
                 },
-                "error_message": None,
-            },
-        )
-        await _mark_done(client, symbol_db)
-        try:
+            )
+            await _mark_done(client, symbol_db)
             base_url, key = _sb_env()
             await _sb_upload_storage_file(
                 client=client,
@@ -1145,17 +1380,17 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 local_file_path=log_local_path,
             )
             print(f"[SIM_LOG] uploaded log file to Simulation_runs/{log_storage_path}")
-        except Exception as upload_err:
-            print(
-                f"[SIM_LOG] upload failed local_path={log_local_path.as_posix()} "
-                f"storage_path=Simulation_runs/{log_storage_path} error={upload_err}"
-            )
-        logger.info("simulation completed successfully for symbol=%s", symbol)
-        return 0
+        except Exception as finalize_err:
+            logger.warning("finalize after cancellation failed for %s: %s", symbol, finalize_err)
+        raise
 
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         logger.exception("simulation failed for symbol=%s: %s", symbol, msg)
+        try:
+            set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
+        except Exception:
+            pass
         try:
             await _update_simulation_run(
                 client,
