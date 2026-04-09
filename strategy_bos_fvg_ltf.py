@@ -304,6 +304,36 @@ def _bridge_setup_rows(state: Dict[str, Any], setup_id: Optional[str]) -> List[D
     return [r for r in state["bridge_rows"] if r.get("setup_id") == setup_id]
 
 
+def _clear_pending_setup_for_new_bos(
+    state: Dict[str, Any],
+    *,
+    symbol: str,
+    timeframe: str,
+    reason: str,
+    new_side: Optional[str] = None,
+    new_bos_ts: Optional[str] = None,
+) -> None:
+    pending = state.get("pending_setup")
+    if not pending:
+        return
+    if DEBUG_LOGS:
+        _db_state_log(
+            symbol,
+            timeframe,
+            "pending_setup_invalidated",
+            reason=reason,
+            old_trade_id=pending.get("trade_id"),
+            old_setup_id=pending.get("setup_id"),
+            old_side=pending.get("side"),
+            old_bos_ts=pending.get("bos_ts"),
+            new_side=new_side,
+            new_bos_ts=new_bos_ts,
+        )
+    state["pending_setup"] = None
+    if state.get("bridge_current_setup_id") == pending.get("setup_id"):
+        state["bridge_current_setup_id"] = None
+
+
 def _bridge_tag_value(row: Dict[str, Any], prefix: str) -> Optional[str]:
     tags = row.get("tags") or []
     want = f"{prefix}:"
@@ -708,6 +738,42 @@ def evaluate_bos_fvg_ltf(
         )
 
     # ------------------------------------------------------------
+    # Catch-up invalidation rules
+    # 1) If selected FVG becomes filled in catch-up, invalidate setup
+    #    and go back to waiting for a new BOS.
+    # 2) If a new BOS occurs while a setup is pending in catch-up,
+    #    invalidate the old setup immediately and track the new BOS.
+    # ------------------------------------------------------------
+    pending = state.get("pending_setup")
+    if pending and (not execution_enabled or not live_mode):
+        selected_fvg = pending.get("fvg")
+        if isinstance(selected_fvg, dict):
+            selected_fvg, _matched_fvg = _refresh_selected_fvg_fields(selected_fvg, fvgs or [])
+            pending["fvg"] = selected_fvg
+            if DEBUG_LOGS:
+                _db_state_log(
+                    symbol,
+                    timeframe,
+                    "fvg_refresh_existing",
+                    trade_id=pending.get("trade_id"),
+                    setup_id=pending.get("setup_id"),
+                    fvg_ts=selected_fvg.get("created_ts"),
+                    fvg_filled=bool(selected_fvg.get("filled")),
+                    trade_score=selected_fvg.get("trade_score"),
+                )
+            if bool(selected_fvg.get("filled")):
+                _clear_pending_setup_for_new_bos(
+                    state,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    reason="catchup_fvg_filled",
+                )
+                state["pending_rearm_setup"] = None
+                pending = None
+
+    pending = state.get("pending_setup")
+
+    # ------------------------------------------------------------
     # Live-boundary materialization:
     # If catch-up already formed a pending setup + selected FVG, the
     # first live candle is allowed to materialize Phase 1 by creating
@@ -880,6 +946,22 @@ def evaluate_bos_fvg_ltf(
     # Setup state management
     if cfg["enabled"] and chosen_bos_detected and chosen_score_pass and cfg["max_open_positions"] >= 1:
         pending = state["pending_setup"]
+        if pending:
+            # In catch-up, a new BOS invalidates the current pending setup
+            # immediately. Then we proceed to publish the new BOS as the new
+            # pending setup below.
+            if not execution_enabled or not live_mode:
+                _clear_pending_setup_for_new_bos(
+                    state,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    reason="catchup_new_bos_replaces_pending",
+                    new_side=chosen_side,
+                    new_bos_ts=last_ts,
+                )
+                state["pending_rearm_setup"] = None
+                pending = None
+
         if pending:
             scope_rows = _bridge_scope_rows(
                 state,
@@ -1083,7 +1165,7 @@ def evaluate_bos_fvg_ltf(
                         trade_id=trade_id,
                         side=state["pending_setup"].get("side"),
                         bos_ts=state["pending_setup"].get("bos_ts"),
-                        source="pending_rearm_setup" if rearm else "current_bos",
+                        source="rearm" if rearm else "current_bos",
                     )
                 state["pending_rearm_setup"] = None
                 if DEBUG_LOGS:
