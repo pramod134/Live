@@ -119,19 +119,6 @@ def _poll_sleep_seconds() -> float:
         return 1.0
 
 
-async def _fetch_latest_rth_1m_ts(engine: CandleEngine, symbol: str) -> Optional[dt.datetime]:
-    rows = await engine._sb_fetch_candles(
-        table="candle_history_1m",
-        symbol=symbol,
-        session_eq="rth",
-        limit=1,
-        order_asc=False,
-    )
-    if not rows:
-        return None
-    return _parse_iso_dt(rows[0].get("ts"))
-
-
 async def _fetch_new_rth_1m_rows(
     engine: CandleEngine,
     symbol: str,
@@ -1181,49 +1168,56 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - DO NOT sync bridge rows to DB
             # ------------------------------------------------------------
             set_bos_fvg_ltf_runtime_mode(execution_enabled=False, live_mode=False)
-            catchup_cutoff_ts = await _fetch_latest_rth_1m_ts(engine, symbol)
-            if catchup_cutoff_ts and (last_processed_ts is None or catchup_cutoff_ts > last_processed_ts):
-                print(
-                    f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
-                    f"seed_last_ts={_ts_str(last_processed_ts)} | catchup_cutoff_ts={_ts_str(catchup_cutoff_ts)}"
+            print(
+                f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
+                f"seed_last_ts={_ts_str(last_processed_ts)} | mode=drain_until_empty"
+            )
+            catchup_batches = 0
+            catchup_rows_total = 0
+            while True:
+                catchup_rows = await _fetch_new_rth_1m_rows(
+                    engine=engine,
+                    symbol=symbol,
+                    after_ts=last_processed_ts,
+                    upto_ts=None,
+                    limit=5000,
                 )
-                while True:
-                    catchup_rows = await _fetch_new_rth_1m_rows(
-                        engine=engine,
-                        symbol=symbol,
-                        after_ts=last_processed_ts,
-                        upto_ts=catchup_cutoff_ts,
-                        limit=5000,
-                    )
-                    if not catchup_rows:
-                        break
-                    processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
-                        engine=engine,
-                        bot=bot,
-                        client=client,
-                        symbol=symbol,
-                        rows_1m=catchup_rows,
-                        bridge_sync_enabled=False,
-                        first_live_ts=first_live_ts,
-                        last_live_ts=last_live_ts,
-                        first_live_to_bot=first_live_to_bot,
-                        last_live_to_bot=last_live_to_bot,
-                    )
-                    emitted_events += processed_events
-                    if processed_ts is None:
-                        break
-                    last_processed_ts = processed_ts
-                    if last_processed_ts >= catchup_cutoff_ts:
-                        break
+                if not catchup_rows:
+                    # Backlog fully drained. Only now do we allow live mode.
+                    break
+
+                catchup_batches += 1
+                catchup_rows_total += len(catchup_rows)
+                first_batch_ts = _ts_str((catchup_rows[0] or {}).get("ts")) if catchup_rows else None
+                last_batch_ts = _ts_str((catchup_rows[-1] or {}).get("ts")) if catchup_rows else None
                 print(
-                    f"[SIM_WORKER] catchup_done | Symbol={symbol} | "
-                    f"last_processed_ts={_ts_str(last_processed_ts)}"
+                    f"[SIM_WORKER] catchup_batch | Symbol={symbol} | "
+                    f"batch={catchup_batches} | rows={len(catchup_rows)} | "
+                    f"first_ts={first_batch_ts} | last_ts={last_batch_ts}"
                 )
-            else:
-                print(
-                    f"[SIM_WORKER] catchup_skipped | Symbol={symbol} | "
-                    f"seed_last_ts={_ts_str(last_processed_ts)}"
+
+                processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
+                    engine=engine,
+                    bot=bot,
+                    client=client,
+                    symbol=symbol,
+                    rows_1m=catchup_rows,
+                    bridge_sync_enabled=False,
+                    first_live_ts=first_live_ts,
+                    last_live_ts=last_live_ts,
+                    first_live_to_bot=first_live_to_bot,
+                    last_live_to_bot=last_live_to_bot,
                 )
+                emitted_events += processed_events
+                if processed_ts is None:
+                    break
+                last_processed_ts = processed_ts
+
+            print(
+                f"[SIM_WORKER] catchup_done | Symbol={symbol} | "
+                f"last_processed_ts={_ts_str(last_processed_ts)} | "
+                f"batches={catchup_batches} | rows_total={catchup_rows_total}"
+            )
 
             # ------------------------------------------------------------
             # Phase 2: continuous live loop
@@ -1232,9 +1226,10 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - sync bridge rows to DB
             # ------------------------------------------------------------
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
+            live_start_anchor_ts = last_processed_ts
             print(
                 f"[SIM_WORKER] live_loop_start | Symbol={symbol} | "
-                f"after_ts={_ts_str(last_processed_ts)} | poll_s={poll_sleep_s}"
+                f"after_ts={_ts_str(live_start_anchor_ts)} | poll_s={poll_sleep_s}"
             )
 
             while True:
