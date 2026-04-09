@@ -186,6 +186,9 @@ def _ensure_state(symbol: str, timeframe: str) -> Dict[str, Any]:
             "bridge_setup_index": {},
             "bridge_current_setup_id": None,
             "bridge_last_swing_ts": {},
+            "bridge_avg_entry": {},
+            "bridge_avg_qty": {},
+            "bridge_eod_close_sent": {},
         }
     return _BOS_FVG_LTF_STATE[key]
 
@@ -246,10 +249,27 @@ def _bridge_insert_rows(
     sl_cond = "cb" if side == "long" else "ca"
     sl_level = fvg_low if side == "long" else fvg_high
     end_time_et = _end_time_et_for_day(bos_ts)
-    leg1_entry = fvg_high if side == "long" else fvg_low
-    leg2_entry = fvg_low if side == "long" else fvg_high
+    fvg_mid = None
+    if fvg_high is not None and fvg_low is not None:
+        fvg_mid = (_safe_float(fvg_high, 0.0) + _safe_float(fvg_low, 0.0)) / 2.0
+
+    # 3-leg ladder:
+    # longs  -> high(1), mid(2), low(3)
+    # shorts -> low(1), mid(2), high(3)
+    if side == "long":
+        leg_levels = [
+            (1, _safe_float(fvg_high), 1),
+            (2, _safe_float(fvg_mid), 2),
+            (3, _safe_float(fvg_low), 3),
+        ]
+    else:
+        leg_levels = [
+            (1, _safe_float(fvg_low), 1),
+            (2, _safe_float(fvg_mid), 2),
+            (3, _safe_float(fvg_high), 3),
+        ]
     rows: List[Dict[str, Any]] = []
-    for leg, entry_level in ((1, leg1_entry), (2, leg2_entry)):
+    for leg, entry_level, qty_per_trade in leg_levels:
         for trade in (1, 2):
             tags = [
                 f"strategy:{strategy_name}",
@@ -264,7 +284,7 @@ def _bridge_insert_rows(
                 "symbol": symbol,
                 "asset_type": "option",
                 "cp": cp,
-                "qty": 1,
+                "qty": qty_per_trade,
                 "entry_type": "equity",
                 "entry_cond": "at",
                 "entry_level": entry_level,
@@ -296,6 +316,31 @@ def _bridge_insert_rows(
     }
     state["bridge_current_setup_id"] = setup_id
     return setup_id
+
+
+def _calc_avg_entry_from_rows(rows: List[Dict[str, Any]]) -> Tuple[Optional[float], float]:
+    total_qty = 0.0
+    total_notional = 0.0
+    for row in rows or []:
+        qty = _safe_float(row.get("qty"), 0.0) or 0.0
+        entry_level = _safe_float(row.get("entry_level"))
+        if qty <= 0 or entry_level is None:
+            continue
+        total_qty += qty
+        total_notional += entry_level * qty
+    if total_qty <= 0:
+        return None, 0.0
+    return total_notional / total_qty, total_qty
+
+
+def _is_eod_close_time(last_ts_value: Any) -> bool:
+    dt_obj = _parse_ts(last_ts_value)
+    if dt_obj is None:
+        return False
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=ZoneInfo("UTC"))
+    et = dt_obj.astimezone(_ET)
+    return (et.hour > 15) or (et.hour == 15 and et.minute >= 56)
 
 
 def _bridge_setup_rows(state: Dict[str, Any], setup_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -1122,9 +1167,10 @@ def evaluate_bos_fvg_ltf(
             if candidate is not None:
                 state["trade_id_counter"] += 1
                 trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
-                top_shares = ENTRY_LEG_SHARES
-                bottom_shares = ENTRY_LEG_SHARES
-                total_shares = top_shares + bottom_shares
+                top_shares = ENTRY_LEG_SHARES * 2
+                mid_shares = ENTRY_LEG_SHARES * 4
+                bottom_shares = ENTRY_LEG_SHARES * 6
+                total_shares = top_shares + mid_shares + bottom_shares
                 state["pending_setup"] = {
                     "trade_id": trade_id,
                     "side": candidate.get("side"),
@@ -1132,6 +1178,7 @@ def evaluate_bos_fvg_ltf(
                     "bos_ts_et": candidate.get("bos_ts_et"),
                     "shares_total": total_shares,
                     "entry_top_shares": top_shares,
+                    "entry_mid_shares": mid_shares,
                     "entry_bottom_shares": bottom_shares,
                     "entry_ref_swing_high": candidate.get("entry_ref_swing_high"),
                     "entry_ref_swing_high_ts": candidate.get("entry_ref_swing_high_ts"),
@@ -1304,37 +1351,117 @@ def evaluate_bos_fvg_ltf(
     bridge_setup_id = state.get("bridge_current_setup_id")
     bridge_rows = _bridge_setup_rows(state, bridge_setup_id)
     bridge_setup_meta = (state.get("bridge_setup_index") or {}).get(bridge_setup_id) or {}
-    managing_trade1 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and r.get("trade") == 1]
-    managing_trade2 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and r.get("trade") == 2]
+    managing_trade1 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and _safe_int(r.get("trade"), 0) == 1]
+    managing_trade2 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and _safe_int(r.get("trade"), 0) == 2]
     if managing_trade1 or managing_trade2:
         bridge_setup_meta["bridge_live_phase_entered"] = True
-    swing_reason = None
-    swing_ts = None
-    swing_level = None
-    target_rows: List[Dict[str, Any]] = []
-    if managing_trade1:
-        if bridge_rows and bridge_rows[0].get("cp") == "call":
+    managing_rows_all = managing_trade1 + managing_trade2
+    avg_entry, avg_qty = _calc_avg_entry_from_rows(managing_rows_all)
+    if bridge_setup_id and avg_entry is not None and avg_qty > 0:
+        state["bridge_avg_entry"][bridge_setup_id] = avg_entry
+        state["bridge_avg_qty"][bridge_setup_id] = avg_qty
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "avg_entry_updated",
+                bridge_current_setup_id=bridge_setup_id,
+                avg_entry=avg_entry,
+                avg_qty=avg_qty,
+                managing_trade1=len(managing_trade1),
+                managing_trade2=len(managing_trade2),
+            )
+
+    # EOD close request at/after 15:56 ET for all surfaced active rows.
+    if bridge_setup_id and bridge_rows and _is_eod_close_time(last_ts):
+        if not state["bridge_eod_close_sent"].get(bridge_setup_id):
+            active_rows_for_setup = [r for r in bridge_rows if bool(r.get("db_active_seen"))]
+            if active_rows_for_setup:
+                changed = _bridge_update_rows(active_rows_for_setup, {"manage": "C"}, "eod_close_1556")
+                if changed:
+                    state["bridge_eod_close_sent"][bridge_setup_id] = True
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol,
+                            timeframe,
+                            "eod_close_request_sent",
+                            bridge_current_setup_id=bridge_setup_id,
+                            active_rows=len(active_rows_for_setup),
+                            changed_rows=changed,
+                        )
+
+    # Phase 3 SL management
+    # Longs use swing lows; shorts use swing highs.
+    # Trade-bucket behavior:
+    #   - if trade1 managing:
+    #       longs  -> ts newer AND swing low  > max(BE, last_trade1_sl)
+    #                 trade1 rows -> swing low, trade2 rows -> BE
+    #       shorts -> ts newer AND swing high < min(BE, last_trade1_sl)
+    #                 trade1 rows -> swing high, trade2 rows -> BE
+    #   - if no trade1 managing but trade2 managing:
+    #       longs  -> ts only gate, trade2 rows -> swing low
+    #       shorts -> ts only gate, trade2 rows -> swing high
+    cp = bridge_rows[0].get("cp") if bridge_rows else None
+    if cp == "call":
+        be_price = state["bridge_avg_entry"].get(bridge_setup_id)
+        if managing_trade1:
             swing_ts = recent_low_ts
             swing_level = recent_low_price
-        else:
-            swing_ts = recent_high_ts
-            swing_level = recent_high_price
-        swing_reason = "swing_update_trade1"
-        target_rows = managing_trade1
-    elif managing_trade2:
-        if bridge_rows and bridge_rows[0].get("cp") == "call":
+            swing_key = f"{bridge_setup_id}:swing_update_trade1"
+            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+            prev_trade1_sl = None
+            for row in managing_trade1:
+                sl_val = _safe_float(row.get("sl_level"))
+                if sl_val is None:
+                    continue
+                prev_trade1_sl = sl_val if prev_trade1_sl is None else max(prev_trade1_sl, sl_val)
+            threshold = max(
+                _safe_float(be_price, float("-inf")) if be_price is not None else float("-inf"),
+                _safe_float(prev_trade1_sl, float("-inf")) if prev_trade1_sl is not None else float("-inf"),
+            )
+            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level > threshold:
+                state["bridge_last_swing_ts"][swing_key] = swing_ts
+                _bridge_update_rows(managing_trade1, {"sl_level": swing_level}, "swing_update_trade1")
+                if managing_trade2 and be_price is not None:
+                    _bridge_update_rows(managing_trade2, {"sl_level": be_price}, "be_update_trade2")
+        elif managing_trade2:
             swing_ts = recent_low_ts
             swing_level = recent_low_price
-        else:
+            swing_key = f"{bridge_setup_id}:swing_update_trade2_only"
+            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
+                state["bridge_last_swing_ts"][swing_key] = swing_ts
+                _bridge_update_rows(managing_trade2, {"sl_level": swing_level}, "swing_update_trade2_only")
+    elif cp == "put":
+        be_price = state["bridge_avg_entry"].get(bridge_setup_id)
+        if managing_trade1:
             swing_ts = recent_high_ts
             swing_level = recent_high_price
-        swing_reason = "swing_update_trade2"
-        target_rows = managing_trade2
-    if target_rows and swing_ts and swing_level is not None:
-        swing_key = f"{bridge_setup_id}:{swing_reason}"
-        if state["bridge_last_swing_ts"].get(swing_key) != swing_ts:
-            state["bridge_last_swing_ts"][swing_key] = swing_ts
-            _bridge_update_rows(target_rows, {"sl_level": swing_level}, swing_reason)
+            swing_key = f"{bridge_setup_id}:swing_update_trade1"
+            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+            prev_trade1_sl = None
+            for row in managing_trade1:
+                sl_val = _safe_float(row.get("sl_level"))
+                if sl_val is None:
+                    continue
+                prev_trade1_sl = sl_val if prev_trade1_sl is None else min(prev_trade1_sl, sl_val)
+            threshold = min(
+                _safe_float(be_price, float("inf")) if be_price is not None else float("inf"),
+                _safe_float(prev_trade1_sl, float("inf")) if prev_trade1_sl is not None else float("inf"),
+            )
+            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level < threshold:
+                state["bridge_last_swing_ts"][swing_key] = swing_ts
+                _bridge_update_rows(managing_trade1, {"sl_level": swing_level}, "swing_update_trade1")
+                if managing_trade2 and be_price is not None:
+                    _bridge_update_rows(managing_trade2, {"sl_level": be_price}, "be_update_trade2")
+        elif managing_trade2:
+            swing_ts = recent_high_ts
+            swing_level = recent_high_price
+            swing_key = f"{bridge_setup_id}:swing_update_trade2_only"
+            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
+                state["bridge_last_swing_ts"][swing_key] = swing_ts
+                _bridge_update_rows(managing_trade2, {"sl_level": swing_level}, "swing_update_trade2_only")
     if bridge_rows:
         has_managing = any(r.get("db_active_status") == "nt-managing" for r in bridge_rows)
         has_active = any(bool(r.get("db_active_seen")) for r in bridge_rows)
@@ -1368,6 +1495,7 @@ def evaluate_bos_fvg_ltf(
                 bridge_setup_meta["bridge_live_phase_entered"] = False
                 if state.get("bridge_current_setup_id") == bridge_setup_id:
                     state["bridge_current_setup_id"] = None
+                state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
             elif not waiting_uncancelled:
                 if DEBUG_LOGS:
                     _db_state_log(
@@ -1378,6 +1506,7 @@ def evaluate_bos_fvg_ltf(
                 bridge_setup_meta["bridge_live_phase_entered"] = False
                 if state.get("bridge_current_setup_id") == bridge_setup_id:
                     state["bridge_current_setup_id"] = None
+                state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
 
             else:
                 # Keep Phase 3 marked entered until cleanup is actually confirmed
