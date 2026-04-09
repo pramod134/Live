@@ -441,10 +441,6 @@ def _sanitize_bridge_new_trades_payload(payload: Dict[str, Any]) -> Dict[str, An
     }
     setup_id = str(payload.get("setup_id") or "").strip()
     out: Dict[str, Any] = {}
-    if payload.get("end_time_et") is not None:
-        end_time = _et_naive_to_utc_iso(payload.get("end_time_et"))
-        if end_time is not None:
-            out["end_time"] = end_time
     out["note"] = f"bridge:{setup_id}" if setup_id else "bridge:"
     out["trade_type"] = "swing"
     for k in allowed:

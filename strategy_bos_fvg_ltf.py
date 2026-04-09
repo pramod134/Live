@@ -118,15 +118,6 @@ def _as_et_str(ts_value: Any) -> Optional[str]:
     return dt.astimezone(_ET).isoformat()
 
 
-def _end_time_et_for_day(ts_value: Any) -> Optional[str]:
-    dt = _parse_ts(ts_value)
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-    et = dt.astimezone(_ET)
-    return et.replace(hour=15, minute=58, second=0, microsecond=0, tzinfo=None).isoformat(sep=" ")
-
 def _latest_swing(swings: Dict[str, Any], swing_type: str, current_ts: Optional[datetime]) -> Optional[Dict[str, Any]]:
     swing_items = (swings or {}).get("swings") or []
     latest = None
@@ -248,7 +239,6 @@ def _bridge_insert_rows(
     cp = "call" if side == "long" else "put"
     sl_cond = "cb" if side == "long" else "ca"
     sl_level = fvg_low if side == "long" else fvg_high
-    end_time_et = _end_time_et_for_day(bos_ts)
     fvg_mid = None
     if fvg_high is not None and fvg_low is not None:
         fvg_mid = (_safe_float(fvg_high, 0.0) + _safe_float(fvg_low, 0.0)) / 2.0
@@ -301,7 +291,6 @@ def _bridge_insert_rows(
                 "db_active_seen": False,
                 "db_active_status": None,
                 "db_active_manage": None,
-                "end_time_et": end_time_et,
                 "leg": leg,
                 "trade": trade,
                 "tags": tags,
