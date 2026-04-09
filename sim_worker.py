@@ -119,6 +119,17 @@ def _poll_sleep_seconds() -> float:
         return 1.0
 
 
+def _supervisor_poll_seconds() -> float:
+    raw = (os.getenv("SIM_SUPERVISOR_POLL_SECONDS") or "").strip()
+    if not raw:
+        return 2.0
+    try:
+        out = float(raw)
+        return 0.5 if out <= 0 else out
+    except Exception:
+        return 2.0
+
+
 async def _fetch_new_rth_1m_rows(
     engine: CandleEngine,
     symbol: str,
@@ -931,36 +942,39 @@ async def _update_simulation_run(
     )
 
 
-async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    """
-    Claim exactly one live_ticker row where start_sim='y'.
-
-    We do this in 2 steps (read -> patch) because we’re on REST.
-    It’s not perfectly atomic like SQL, but it’s good enough for a single-run worker.
-    """
+async def _list_live_ticker_rows(client: httpx.AsyncClient) -> list[Dict[str, Any]]:
     base_url, key = _sb_env()
-
-    # 1) Find one candidate job
-    job = await _sb_select_one(
+    rows = await _sb_select(
         client,
         base_url,
         key,
         "live_ticker",
         params={
             "select": "*",
-            "start_sim": "eq.y",
-            "limit": "1",
+            "order": "symbol.asc",
         },
     )
-    if not job:
-        return None
+    out: list[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row2 = dict(row)
+        row2["_symbol_db"] = str(row2.get("symbol") or "")
+        out.append(row2)
+    return out
 
-    symbol_db = str(job.get("symbol") or "")
-    symbol = symbol_db.upper()
+
+async def _start_job_row(client: httpx.AsyncClient, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Mark a live_ticker row as running and assign a fresh run_id,
+    but DO NOT change start_sim. It remains the desired on/off switch.
+    """
+    base_url, key = _sb_env()
+    symbol_db = str(row.get("_symbol_db") or row.get("symbol") or "")
+    if not symbol_db:
+        return None
     run_id = str(uuid.uuid4())
     now = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    # 2) Patch it to running + flip start_sim to 'n'
     updated = await _sb_patch(
         client,
         base_url,
@@ -968,7 +982,6 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         "live_ticker",
         params={"symbol": f"eq.{symbol_db}"},
         payload={
-            "start_sim": "n",
             "status": "running",
             "run_id": run_id,
             "started_at": now,
@@ -981,13 +994,13 @@ async def _claim_one_job(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     # PostgREST returns a list for PATCH with representation
     if isinstance(updated, list):
         if not updated:
-            logger.warning("claim patch matched zero live_ticker rows for symbol=%s", symbol_db)
+            logger.warning("start patch matched zero live_ticker rows for symbol=%s", symbol_db)
             return None
         out = dict(updated[0])
     elif isinstance(updated, dict):
         out = dict(updated)
     else:
-        logger.warning("claim patch returned unexpected payload type=%s for symbol=%s", type(updated).__name__, symbol_db)
+        logger.warning("start patch returned unexpected payload type=%s for symbol=%s", type(updated).__name__, symbol_db)
         return None
 
     out["_symbol_db"] = symbol_db
@@ -1057,6 +1070,26 @@ async def _mark_done(client: httpx.AsyncClient, symbol: str) -> None:
         "live_ticker",
         params={"symbol": f"eq.{symbol}"},
         payload={"status": "done", "finished_at": now},
+        returning="minimal",
+    )
+
+
+async def _mark_stopped(client: httpx.AsyncClient, symbol: str, note: Optional[str] = None) -> None:
+    base_url, key = _sb_env()
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload: Dict[str, Any] = {
+        "status": "stopped",
+        "finished_at": now,
+    }
+    if note:
+        payload["error_message"] = note[:2000]
+    await _sb_patch(
+        client,
+        base_url,
+        key,
+        "live_ticker",
+        params={"symbol": f"eq.{symbol}"},
+        payload=payload,
         returning="minimal",
     )
 
@@ -1430,6 +1463,37 @@ async def _run_job_in_subprocess(job: Dict[str, Any]) -> int:
     return await proc.wait()
 
 
+async def _spawn_job_subprocess(job: Dict[str, Any]) -> asyncio.subprocess.Process:
+    symbol_db = str(job.get("_symbol_db") or job.get("symbol") or "")
+    run_id = str(job.get("run_id") or "")
+    env = os.environ.copy()
+    env["SIM_CHILD_RUN"] = "1"
+    env["SIM_CHILD_SYMBOL"] = symbol_db
+    env["SIM_CHILD_RUN_ID"] = run_id
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        __file__,
+        env=env,
+    )
+
+
+async def _stop_child_process(proc: asyncio.subprocess.Process, *, timeout_s: float = 10.0) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        await proc.wait()
+
+
 async def main() -> int:
     logger.info("sim worker booting")
     # quick env validation early
@@ -1453,36 +1517,107 @@ async def main() -> int:
                 return 1
             return await _run_claimed_job(client, claimed)
 
-        jobs: list[Dict[str, Any]] = []
+        poll_s = _supervisor_poll_seconds()
+        running_children: Dict[str, Dict[str, Any]] = {}
+        logger.info("sim supervisor started; poll_s=%s", poll_s)
+
         while True:
-            job = await _claim_one_job(client)
-            if not job:
-                break
-            jobs.append(job)
+            try:
+                rows = await _list_live_ticker_rows(client)
+            except Exception as e:
+                logger.warning("failed to list live_ticker rows: %s", e)
+                await asyncio.sleep(poll_s)
+                continue
 
-        if not jobs:
-            logger.info("no live_ticker rows with start_sim='y'; worker exiting")
-            return 0
+            rows_by_symbol: Dict[str, Dict[str, Any]] = {
+                str(r.get("_symbol_db") or r.get("symbol") or ""): r
+                for r in rows
+                if str(r.get("_symbol_db") or r.get("symbol") or "")
+            }
 
-        max_parallel = _parallel_workers_from_env(len(jobs))
-        logger.info("claimed %d simulation jobs; parallel_workers=%d", len(jobs), max_parallel)
+            # Start rows that want to run and do not already have a child.
+            for symbol_db, row in rows_by_symbol.items():
+                desired_on = str(row.get("start_sim") or "").strip().lower() == "y"
+                child_info = running_children.get(symbol_db)
+                if desired_on and child_info is None:
+                    try:
+                        started = await _start_job_row(client, row)
+                        if not started:
+                            continue
+                        proc = await _spawn_job_subprocess(started)
+                        running_children[symbol_db] = {
+                            "proc": proc,
+                            "run_id": started.get("run_id"),
+                        }
+                        logger.info(
+                            "spawned child for symbol=%s run_id=%s pid=%s",
+                            symbol_db,
+                            started.get("run_id"),
+                            getattr(proc, "pid", None),
+                        )
+                    except Exception as e:
+                        logger.exception("failed to spawn child for symbol=%s: %s", symbol_db, e)
+                        try:
+                            await _mark_error(client, symbol_db, f"spawn failed: {type(e).__name__}: {e}")
+                        except Exception:
+                            pass
 
-        if max_parallel == 1 or len(jobs) == 1:
-            result = 0
-            for j in jobs:
-                rc = await _run_claimed_job(client, j)
-                if rc != 0:
-                    result = rc
-            return result
+            # Stop children whose rows no longer want to run, or whose row disappeared.
+            for symbol_db, info in list(running_children.items()):
+                row = rows_by_symbol.get(symbol_db)
+                desired_on = bool(row) and str(row.get("start_sim") or "").strip().lower() == "y"
+                if not desired_on:
+                    proc = info.get("proc")
+                    if proc is not None:
+                        try:
+                            await _stop_child_process(proc)
+                        except Exception as e:
+                            logger.warning("failed to stop child for symbol=%s: %s", symbol_db, e)
+                    try:
+                        await _mark_stopped(client, symbol_db, note="start_sim turned off")
+                    except Exception as e:
+                        logger.warning("failed to mark stopped for symbol=%s: %s", symbol_db, e)
+                    running_children.pop(symbol_db, None)
+                    logger.info("stopped child for symbol=%s because start_sim is not 'y'", symbol_db)
 
-        semaphore = asyncio.Semaphore(max_parallel)
+            # Respawn children that died unexpectedly while the row still wants to run.
+            for symbol_db, info in list(running_children.items()):
+                proc = info.get("proc")
+                if proc is None:
+                    continue
+                rc = proc.returncode
+                if rc is None:
+                    continue
 
-        async def _run_limited(j: Dict[str, Any]) -> int:
-            async with semaphore:
-                return await _run_job_in_subprocess(j)
+                row = rows_by_symbol.get(symbol_db)
+                desired_on = bool(row) and str(row.get("start_sim") or "").strip().lower() == "y"
+                logger.info("child exited for symbol=%s rc=%s desired_on=%s", symbol_db, rc, desired_on)
+                running_children.pop(symbol_db, None)
 
-        results = await asyncio.gather(*[_run_limited(j) for j in jobs], return_exceptions=False)
-        return 0 if all(int(rc) == 0 for rc in results) else 1
+                if desired_on and row is not None:
+                    try:
+                        started = await _start_job_row(client, row)
+                        if not started:
+                            continue
+                        proc2 = await _spawn_job_subprocess(started)
+                        running_children[symbol_db] = {
+                            "proc": proc2,
+                            "run_id": started.get("run_id"),
+                        }
+                        logger.info(
+                            "respawned child for symbol=%s run_id=%s pid=%s",
+                            symbol_db,
+                            started.get("run_id"),
+                            getattr(proc2, "pid", None),
+                        )
+                    except Exception as e:
+                        logger.exception("failed to respawn child for symbol=%s: %s", symbol_db, e)
+                        try:
+                            await _mark_error(client, symbol_db, f"respawn failed: {type(e).__name__}: {e}")
+                        except Exception:
+                            pass
+
+            await asyncio.sleep(poll_s)
 
 
 if __name__ == "__main__":
