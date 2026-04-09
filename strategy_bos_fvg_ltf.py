@@ -1076,18 +1076,31 @@ def evaluate_bos_fvg_ltf(
                         )
                     _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
                     pending["cancel_requested"] = True
-                elif DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "phase2_case2_cancel_skipped_no_waiting_rows",
-                        trade_id=pending.get("trade_id"),
-                        setup_id=pending.get("setup_id"),
-                        **_bridge_counts(scope_rows),
-                    )
-                # Do NOT clear pending_setup here based on the current BOS branch.
-                # Cancel-confirmation is handled every candle above, independent
-                # of whether another BOS happens again.
+                else:
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol,
+                            timeframe,
+                            "phase2_case2_cancel_skipped_no_waiting_rows",
+                            trade_id=pending.get("trade_id"),
+                            setup_id=pending.get("setup_id"),
+                            **_bridge_counts(scope_rows),
+                        )
+                    old_setup_id = pending.get("setup_id")
+                    state["pending_setup"] = None
+                    if state.get("bridge_current_setup_id") == old_setup_id:
+                        state["bridge_current_setup_id"] = None
+                    setup_meta = (state.get("bridge_setup_index") or {}).get(old_setup_id) or {}
+                    setup_meta["bridge_live_phase_entered"] = False
+                    pending = None
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol,
+                            timeframe,
+                            "phase2_to_phase1_rearm_ready_no_waiting_rows",
+                            source="no_waiting_rows",
+                            old_setup_id=old_setup_id,
+                        )
             elif DEBUG_LOGS:
                 _db_state_log(
                     symbol,
