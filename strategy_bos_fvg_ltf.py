@@ -13,6 +13,24 @@ _ET = ZoneInfo("America/New_York")
 DEBUG_LOGS = str(os.getenv("BOS_FVG_DEBUG_LOGS", "0")).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 ENTRY_LEG_SHARES = 100
 BRIDGE_VERSION = (os.getenv("BOS_FVG_LTF_VERSION") or "v1").strip() or "v1"
+_RUNTIME_MODE: Dict[str, Any] = {
+    "execution_enabled": True,
+    "live_mode": True,
+}
+
+
+def set_bridge_runtime_mode(*, execution_enabled: bool, live_mode: bool) -> None:
+    """
+    Runtime control used by sim_worker:
+      - catch-up: execution_enabled=False, live_mode=False
+      - live:     execution_enabled=True,  live_mode=True
+    """
+    _RUNTIME_MODE["execution_enabled"] = bool(execution_enabled)
+    _RUNTIME_MODE["live_mode"] = bool(live_mode)
+
+
+def get_bridge_runtime_mode() -> Dict[str, Any]:
+    return dict(_RUNTIME_MODE)
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -540,6 +558,9 @@ def evaluate_bos_fvg_ltf(
 ) -> Dict[str, Any]:
     state = _ensure_state(symbol, timeframe)
     cfg = state["config"]
+    runtime = get_bridge_runtime_mode()
+    execution_enabled = bool(runtime.get("execution_enabled", True))
+    live_mode = bool(runtime.get("live_mode", True))
 
     if str(timeframe or "").lower() not in {"1m", "3m", "5m"}:
         return {
@@ -554,6 +575,8 @@ def evaluate_bos_fvg_ltf(
             "last_signal": deepcopy(state["signals"][-1] if state["signals"] else None),
             "bridge_current_setup_id": state.get("bridge_current_setup_id"),
             "live_trade_rows": deepcopy(state.get("bridge_rows") or []),
+            "execution_enabled": execution_enabled,
+            "live_mode": live_mode,
         }
 
     last_candle = candles[-1] if candles else {}
@@ -678,9 +701,57 @@ def evaluate_bos_fvg_ltf(
             chosen_side=chosen_side,
             chosen_bos_detected=chosen_bos_detected,
             chosen_score_pass=chosen_score_pass,
+            execution_enabled=execution_enabled,
+            live_mode=live_mode,
             **pending_dbg,
             **rearm_dbg,
         )
+
+    # ------------------------------------------------------------
+    # Live-boundary materialization:
+    # If catch-up already formed a pending setup + selected FVG, the
+    # first live candle is allowed to materialize Phase 1 by creating
+    # bridge rows at that point.
+    # ------------------------------------------------------------
+    pending = state.get("pending_setup")
+    if (
+        pending
+        and execution_enabled
+        and live_mode
+        and pending.get("fvg")
+        and not pending.get("setup_id")
+    ):
+        fvg_now = pending.get("fvg") or {}
+        setup_id = _bridge_insert_rows(
+            state=state,
+            symbol=symbol,
+            timeframe=timeframe,
+            side=pending.get("side"),
+            version=BRIDGE_VERSION,
+            strategy_name="bos_fvg_ltf",
+            bos_ts=pending.get("bos_ts"),
+            fvg_high=_safe_float(fvg_now.get("high")),
+            fvg_low=_safe_float(fvg_now.get("low")),
+        )
+        pending["setup_id"] = setup_id or _deterministic_setup_id(
+            symbol,
+            timeframe,
+            pending.get("bos_ts"),
+            BRIDGE_VERSION,
+            pending.get("side"),
+            _safe_float(fvg_now.get("high")),
+            _safe_float(fvg_now.get("low")),
+        )
+        pending["notes"] = "live_materialized_from_existing_pending_setup"
+        if DEBUG_LOGS:
+            _db_state_log(
+                symbol,
+                timeframe,
+                "live_boundary_materialize_pending_setup",
+                trade_id=pending.get("trade_id"),
+                setup_id=pending.get("setup_id"),
+                fvg_ts=fvg_now.get("created_ts"),
+            )
 
     # ------------------------------------------------------------
     # Phase 2 -> Phase 3 transition handling (runs every candle)
@@ -1058,37 +1129,55 @@ def evaluate_bos_fvg_ltf(
                 f"FVGScore={fvg_score} | TradeScore={trade_score} | FVGScoreSrc={fvg_score_src} | TradeScoreSrc={trade_score_src} | "
                 f"FVG={json.dumps(fvg, default=str, sort_keys=True)}"
             )
-            setup_id = _bridge_insert_rows(
-                state=state,
-                symbol=symbol,
-                timeframe=timeframe,
-                side=pending.get("side"),
-                version=BRIDGE_VERSION,
-                strategy_name="bos_fvg_ltf",
-                bos_ts=pending.get("bos_ts"),
-                fvg_high=_safe_float(fvg.get("high")),
-                fvg_low=_safe_float(fvg.get("low")),
-            )
-            pending["setup_id"] = setup_id or _deterministic_setup_id(
-                symbol,
-                timeframe,
-                pending.get("bos_ts"),
-                BRIDGE_VERSION,
-                pending.get("side"),
-                _safe_float(fvg.get("high")),
-                _safe_float(fvg.get("low")),
-            )
-            if DEBUG_LOGS:
-                _db_state_log(
+            if execution_enabled and live_mode:
+                setup_id = _bridge_insert_rows(
+                    state=state,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    side=pending.get("side"),
+                    version=BRIDGE_VERSION,
+                    strategy_name="bos_fvg_ltf",
+                    bos_ts=pending.get("bos_ts"),
+                    fvg_high=_safe_float(fvg.get("high")),
+                    fvg_low=_safe_float(fvg.get("low")),
+                )
+                pending["setup_id"] = setup_id or _deterministic_setup_id(
                     symbol,
                     timeframe,
-                    "fvg_selected_and_rows_created",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    fvg_ts=pending["fvg"].get("created_ts"),
-                    fvg_low=pending["fvg"].get("low"),
-                    fvg_high=pending["fvg"].get("high"),
+                    pending.get("bos_ts"),
+                    BRIDGE_VERSION,
+                    pending.get("side"),
+                    _safe_float(fvg.get("high")),
+                    _safe_float(fvg.get("low")),
                 )
+                pending["notes"] = "fvg_selected_live_rows_created"
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "fvg_selected_and_rows_created",
+                        trade_id=pending.get("trade_id"),
+                        setup_id=pending.get("setup_id"),
+                        fvg_ts=pending["fvg"].get("created_ts"),
+                        fvg_low=pending["fvg"].get("low"),
+                        fvg_high=pending["fvg"].get("high"),
+                    )
+            else:
+                # Catch-up mode:
+                # keep the pending setup + selected FVG, but do NOT materialize
+                # Phase 1 rows yet. The first live candle can materialize later.
+                pending["setup_id"] = None
+                pending["notes"] = "fvg_selected_catchup_waiting_for_live_materialization"
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "fvg_selected_catchup_no_rows_created",
+                        trade_id=pending.get("trade_id"),
+                        fvg_ts=pending["fvg"].get("created_ts"),
+                        fvg_low=pending["fvg"].get("low"),
+                        fvg_high=pending["fvg"].get("high"),
+                    )
         elif DEBUG_LOGS:
             _db_state_log(
                 symbol,
@@ -1277,6 +1366,8 @@ def evaluate_bos_fvg_ltf(
         "signal_count": len(state["signals"]),
         "bridge_current_setup_id": state.get("bridge_current_setup_id"),
         "live_trade_rows": deepcopy(state["bridge_rows"]),
+        "execution_enabled": execution_enabled,
+        "live_mode": live_mode,
     }
     state["latest_snapshot"] = snapshot
     return snapshot
