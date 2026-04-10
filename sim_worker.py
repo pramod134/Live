@@ -6,6 +6,7 @@ import logging
 import io
 import sys
 import json
+from copy import deepcopy
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
@@ -24,6 +25,9 @@ from strategy_bos_fvg_ltf import (
     get_live_bridge_rows as get_bos_fvg_ltf_live_bridge_rows,
     apply_live_bridge_db_state as apply_bos_fvg_ltf_live_bridge_db_state,
     set_bridge_runtime_mode as set_bos_fvg_ltf_runtime_mode,
+    get_bridge_runtime_mode as get_bos_fvg_ltf_runtime_mode,
+    export_bridge_snapshot_for_symbol as export_bos_fvg_ltf_snapshot_for_symbol,
+    restore_bridge_snapshot_for_symbol as restore_bos_fvg_ltf_snapshot_for_symbol,
 )
 import spot_event as spot_event_module
 
@@ -677,6 +681,180 @@ def _to_iso_utc(value: Any) -> Optional[str]:
         return None
 
 
+def _snapshot_dir() -> Path:
+    raw = (os.getenv("SIM_WORKER_SNAPSHOT_DIR") or "sim_worker_snapshots").strip()
+    return Path(raw)
+
+
+def _snapshot_path(symbol: str) -> Path:
+    return _snapshot_dir() / f"{str(symbol or '').upper()}.json"
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dt.datetime):
+        return {"__type__": "datetime", "value": _iso_utc(value)}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
+def _json_restore(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_json_restore(v) for v in value]
+    if isinstance(value, dict):
+        marker = value.get("__type__")
+        if marker == "datetime":
+            return _parse_iso_dt(value.get("value"))
+        return {k: _json_restore(v) for k, v in value.items()}
+    return value
+
+
+def _write_snapshot_file(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, default=str, sort_keys=True)
+    tmp_path.replace(path)
+
+
+def _load_local_snapshot(symbol: str) -> Optional[Dict[str, Any]]:
+    path = _snapshot_path(symbol)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _delete_local_snapshot(symbol: str) -> None:
+    path = _snapshot_path(symbol)
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _build_worker_snapshot(
+    *,
+    symbol: str,
+    run_id: str,
+    seed_date: str,
+    sim_period: int,
+    engine: CandleEngine,
+    first_live_ts: Dict[str, str],
+    last_live_ts: Dict[str, str],
+    first_live_to_bot: Optional[Dict[str, Any]],
+    last_live_to_bot: Optional[Dict[str, Any]],
+    emitted_events: int,
+    last_processed_ts: Optional[dt.datetime],
+) -> Dict[str, Any]:
+    sym = str(symbol or "").upper()
+    engine_candles = deepcopy((engine.candles or {}).get(sym, {}))
+    engine_latest_ts = deepcopy((engine.latest_ts or {}).get(sym, {}))
+    return {
+        "snapshot_version": 1,
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "symbol": sym,
+        "run_id": str(run_id or ""),
+        "seed_date": str(seed_date or ""),
+        "sim_period": int(sim_period or 0),
+        "last_processed_ts": _to_iso_utc(last_processed_ts),
+        "first_live_ts": deepcopy(first_live_ts or {}),
+        "last_live_ts": deepcopy(last_live_ts or {}),
+        "first_live_to_bot": _json_safe(deepcopy(first_live_to_bot)),
+        "last_live_to_bot": _json_safe(deepcopy(last_live_to_bot)),
+        "emitted_events": int(emitted_events or 0),
+        "engine_state": {
+            "candles": _json_safe(engine_candles),
+            "latest_ts": _json_safe(engine_latest_ts),
+            "sim_clock_ts": _to_iso_utc(getattr(engine, "sim_clock_ts", None)),
+        },
+        "bridge_state": export_bos_fvg_ltf_snapshot_for_symbol(sym),
+    }
+
+
+def _persist_local_snapshot(
+    *,
+    symbol: str,
+    run_id: str,
+    seed_date: str,
+    sim_period: int,
+    engine: CandleEngine,
+    first_live_ts: Dict[str, str],
+    last_live_ts: Dict[str, str],
+    first_live_to_bot: Optional[Dict[str, Any]],
+    last_live_to_bot: Optional[Dict[str, Any]],
+    emitted_events: int,
+    last_processed_ts: Optional[dt.datetime],
+) -> None:
+    payload = _build_worker_snapshot(
+        symbol=symbol,
+        run_id=run_id,
+        seed_date=seed_date,
+        sim_period=sim_period,
+        engine=engine,
+        first_live_ts=first_live_ts,
+        last_live_ts=last_live_ts,
+        first_live_to_bot=first_live_to_bot,
+        last_live_to_bot=last_live_to_bot,
+        emitted_events=emitted_events,
+        last_processed_ts=last_processed_ts,
+    )
+    _write_snapshot_file(_snapshot_path(symbol), payload)
+
+
+def _restore_from_local_snapshot(
+    *,
+    symbol: str,
+    seed_date: str,
+    sim_period: int,
+    engine: CandleEngine,
+) -> Optional[Dict[str, Any]]:
+    payload = _load_local_snapshot(symbol)
+    if not payload:
+        return None
+    if str(payload.get("symbol") or "").upper() != str(symbol or "").upper():
+        return None
+    if str(payload.get("seed_date") or "") != str(seed_date or ""):
+        return None
+    if int(payload.get("sim_period") or 0) != int(sim_period or 0):
+        return None
+
+    engine_state = payload.get("engine_state") if isinstance(payload.get("engine_state"), dict) else {}
+    sym = str(symbol or "").upper()
+    candles_state = _json_restore(engine_state.get("candles") or {})
+    latest_ts_state = _json_restore(engine_state.get("latest_ts") or {})
+    engine.candles.setdefault(sym, {})
+    engine.latest_ts.setdefault(sym, {})
+    if isinstance(candles_state, dict):
+        engine.candles[sym] = candles_state
+    if isinstance(latest_ts_state, dict):
+        engine.latest_ts[sym] = latest_ts_state
+    engine.sim_clock_ts = _parse_iso_dt(engine_state.get("sim_clock_ts"))
+
+    bridge_state = payload.get("bridge_state")
+    if isinstance(bridge_state, dict):
+        restore_bos_fvg_ltf_snapshot_for_symbol(sym, bridge_state)
+
+    restored = {
+        "last_processed_ts": _parse_iso_dt(payload.get("last_processed_ts")),
+        "first_live_ts": payload.get("first_live_ts") if isinstance(payload.get("first_live_ts"), dict) else {},
+        "last_live_ts": payload.get("last_live_ts") if isinstance(payload.get("last_live_ts"), dict) else {},
+        "first_live_to_bot": _json_restore(payload.get("first_live_to_bot")),
+        "last_live_to_bot": _json_restore(payload.get("last_live_to_bot")),
+        "emitted_events": int(payload.get("emitted_events") or 0),
+        "restored_run_id": str(payload.get("run_id") or ""),
+        "runtime_mode": get_bos_fvg_ltf_runtime_mode(),
+    }
+    return restored
+
+
 def _normalize_trade(trade: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "entry_ts": _to_iso_utc(trade.get("entry_fill_timestamp") or trade.get("entry_signal_timestamp")),
@@ -1189,6 +1367,27 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             emitted_events = 0
             poll_sleep_s = _poll_sleep_seconds()
             last_processed_ts = engine.latest_ts.get(symbol, {}).get("1m")
+            restored_snapshot = _restore_from_local_snapshot(
+                symbol=symbol,
+                seed_date=str(seed_date),
+                sim_period=sim_period,
+                engine=engine,
+            )
+            if restored_snapshot:
+                first_live_ts = dict(restored_snapshot.get("first_live_ts") or {})
+                last_live_ts = dict(restored_snapshot.get("last_live_ts") or {})
+                first_live_to_bot = restored_snapshot.get("first_live_to_bot")
+                last_live_to_bot = restored_snapshot.get("last_live_to_bot")
+                emitted_events = int(restored_snapshot.get("emitted_events") or 0)
+                last_processed_ts = restored_snapshot.get("last_processed_ts") or last_processed_ts
+                runtime_mode = restored_snapshot.get("runtime_mode") if isinstance(restored_snapshot.get("runtime_mode"), dict) else {}
+                print(
+                    f"[SIM_WORKER] snapshot_restore | Symbol={symbol} | "
+                    f"snapshot_run_id={restored_snapshot.get('restored_run_id')} | "
+                    f"resume_last_ts={_ts_str(last_processed_ts)} | "
+                    f"execution_enabled={runtime_mode.get('execution_enabled')} | "
+                    f"live_mode={runtime_mode.get('live_mode')}"
+                )
 
             # ------------------------------------------------------------
             # Phase 1: catch-up
@@ -1196,57 +1395,77 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - DO NOT materialize bridge rows
             # - DO NOT sync bridge rows to DB
             # ------------------------------------------------------------
-            set_bos_fvg_ltf_runtime_mode(execution_enabled=False, live_mode=False)
-            print(
-                f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
-                f"seed_last_ts={_ts_str(last_processed_ts)} | mode=drain_until_empty"
-            )
             catchup_batches = 0
             catchup_rows_total = 0
-            while True:
-                catchup_rows = await _fetch_new_rth_1m_rows(
-                    engine=engine,
-                    symbol=symbol,
-                    after_ts=last_processed_ts,
-                    upto_ts=None,
-                    limit=5000,
-                )
-                if not catchup_rows:
-                    # Backlog fully drained. Only now do we allow live mode.
-                    break
-
-                catchup_batches += 1
-                catchup_rows_total += len(catchup_rows)
-                first_batch_ts = _ts_str((catchup_rows[0] or {}).get("ts")) if catchup_rows else None
-                last_batch_ts = _ts_str((catchup_rows[-1] or {}).get("ts")) if catchup_rows else None
+            restored_runtime = get_bos_fvg_ltf_runtime_mode() if restored_snapshot else {}
+            resume_direct_live = bool(restored_snapshot) and bool(restored_runtime.get("execution_enabled")) and bool(restored_runtime.get("live_mode"))
+            if not resume_direct_live:
+                set_bos_fvg_ltf_runtime_mode(execution_enabled=False, live_mode=False)
                 print(
-                    f"[SIM_WORKER] catchup_batch | Symbol={symbol} | "
-                    f"batch={catchup_batches} | rows={len(catchup_rows)} | "
-                    f"first_ts={first_batch_ts} | last_ts={last_batch_ts}"
+                    f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
+                    f"seed_last_ts={_ts_str(last_processed_ts)} | mode=drain_until_empty"
                 )
+                while True:
+                    catchup_rows = await _fetch_new_rth_1m_rows(
+                        engine=engine,
+                        symbol=symbol,
+                        after_ts=last_processed_ts,
+                        upto_ts=None,
+                        limit=5000,
+                    )
+                    if not catchup_rows:
+                        break
 
-                processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
-                    engine=engine,
-                    bot=bot,
-                    client=client,
-                    symbol=symbol,
-                    rows_1m=catchup_rows,
-                    bridge_sync_enabled=False,
-                    first_live_ts=first_live_ts,
-                    last_live_ts=last_live_ts,
-                    first_live_to_bot=first_live_to_bot,
-                    last_live_to_bot=last_live_to_bot,
+                    catchup_batches += 1
+                    catchup_rows_total += len(catchup_rows)
+                    first_batch_ts = _ts_str((catchup_rows[0] or {}).get("ts")) if catchup_rows else None
+                    last_batch_ts = _ts_str((catchup_rows[-1] or {}).get("ts")) if catchup_rows else None
+                    print(
+                        f"[SIM_WORKER] catchup_batch | Symbol={symbol} | "
+                        f"batch={catchup_batches} | rows={len(catchup_rows)} | "
+                        f"first_ts={first_batch_ts} | last_ts={last_batch_ts}"
+                    )
+
+                    processed_ts, first_live_to_bot, last_live_to_bot, processed_events = await _process_rth_1m_rows(
+                        engine=engine,
+                        bot=bot,
+                        client=client,
+                        symbol=symbol,
+                        rows_1m=catchup_rows,
+                        bridge_sync_enabled=False,
+                        first_live_ts=first_live_ts,
+                        last_live_ts=last_live_ts,
+                        first_live_to_bot=first_live_to_bot,
+                        last_live_to_bot=last_live_to_bot,
+                    )
+                    emitted_events += processed_events
+                    if processed_ts is None:
+                        break
+                    last_processed_ts = processed_ts
+                    _persist_local_snapshot(
+                        symbol=symbol,
+                        run_id=run_id,
+                        seed_date=str(seed_date),
+                        sim_period=sim_period,
+                        engine=engine,
+                        first_live_ts=first_live_ts,
+                        last_live_ts=last_live_ts,
+                        first_live_to_bot=first_live_to_bot,
+                        last_live_to_bot=last_live_to_bot,
+                        emitted_events=emitted_events,
+                        last_processed_ts=last_processed_ts,
+                    )
+
+                print(
+                    f"[SIM_WORKER] catchup_done | Symbol={symbol} | "
+                    f"last_processed_ts={_ts_str(last_processed_ts)} | "
+                    f"batches={catchup_batches} | rows_total={catchup_rows_total}"
                 )
-                emitted_events += processed_events
-                if processed_ts is None:
-                    break
-                last_processed_ts = processed_ts
-
-            print(
-                f"[SIM_WORKER] catchup_done | Symbol={symbol} | "
-                f"last_processed_ts={_ts_str(last_processed_ts)} | "
-                f"batches={catchup_batches} | rows_total={catchup_rows_total}"
-            )
+            else:
+                print(
+                    f"[SIM_WORKER] catchup_skipped_snapshot_resume | Symbol={symbol} | "
+                    f"resume_last_ts={_ts_str(last_processed_ts)}"
+                )
 
             # ------------------------------------------------------------
             # Phase 2: continuous live loop
@@ -1292,6 +1511,19 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 emitted_events += processed_events
                 if processed_ts is not None:
                     last_processed_ts = processed_ts
+                    _persist_local_snapshot(
+                        symbol=symbol,
+                        run_id=run_id,
+                        seed_date=str(seed_date),
+                        sim_period=sim_period,
+                        engine=engine,
+                        first_live_ts=first_live_ts,
+                        last_live_ts=last_live_ts,
+                        first_live_to_bot=first_live_to_bot,
+                        last_live_to_bot=last_live_to_bot,
+                        emitted_events=emitted_events,
+                        last_processed_ts=last_processed_ts,
+                    )
                     try:
                         await _update_simulation_run(
                             client,
@@ -1394,6 +1626,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 },
             )
             await _mark_done(client, symbol_db)
+            _delete_local_snapshot(symbol)
             base_url, key = _sb_env()
             await _sb_upload_storage_file(
                 client=client,

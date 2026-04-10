@@ -33,6 +33,70 @@ def get_bridge_runtime_mode() -> Dict[str, Any]:
     return dict(_RUNTIME_MODE)
 
 
+def _snapshot_serialize(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return {"__type__": "datetime", "value": value.isoformat()}
+    if isinstance(value, set):
+        return {"__type__": "set", "value": [_snapshot_serialize(v) for v in sorted(value, key=lambda x: str(x))]}
+    if isinstance(value, tuple):
+        return {"__type__": "tuple", "value": [_snapshot_serialize(v) for v in value]}
+    if isinstance(value, list):
+        return [_snapshot_serialize(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _snapshot_serialize(v) for k, v in value.items()}
+    return value
+
+
+def _snapshot_deserialize(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_snapshot_deserialize(v) for v in value]
+    if isinstance(value, dict):
+        marker = value.get("__type__")
+        if marker == "datetime":
+            try:
+                return datetime.fromisoformat(str(value.get("value") or ""))
+            except Exception:
+                return value.get("value")
+        if marker == "set":
+            return set(_snapshot_deserialize(v) for v in (value.get("value") or []))
+        if marker == "tuple":
+            return tuple(_snapshot_deserialize(v) for v in (value.get("value") or []))
+        return {k: _snapshot_deserialize(v) for k, v in value.items()}
+    return value
+
+
+def export_bridge_snapshot_for_symbol(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol or "").upper()
+    out: Dict[str, Any] = {
+        "symbol": sym,
+        "runtime_mode": get_bridge_runtime_mode(),
+        "states": {},
+    }
+    for (row_symbol, timeframe), state in _BOS_FVG_LTF_STATE.items():
+        if str(row_symbol or "").upper() != sym:
+            continue
+        out["states"][str(timeframe)] = _snapshot_serialize(deepcopy(state))
+    return out
+
+
+def restore_bridge_snapshot_for_symbol(symbol: str, snapshot: Dict[str, Any]) -> None:
+    sym = str(symbol or "").upper()
+    if not isinstance(snapshot, dict):
+        return
+    runtime_mode = snapshot.get("runtime_mode")
+    if isinstance(runtime_mode, dict):
+        _RUNTIME_MODE["execution_enabled"] = bool(runtime_mode.get("execution_enabled", True))
+        _RUNTIME_MODE["live_mode"] = bool(runtime_mode.get("live_mode", True))
+    states = snapshot.get("states")
+    if not isinstance(states, dict):
+        return
+    for timeframe, raw_state in states.items():
+        key = (sym, str(timeframe))
+        restored = _snapshot_deserialize(raw_state)
+        if isinstance(restored, dict):
+            _BOS_FVG_LTF_STATE[key] = restored
+
+
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None:
