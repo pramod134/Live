@@ -560,13 +560,23 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
 
         # Phase 3 (live): allow live-management fields only when DB says row is live
         elif db_active_seen and str(db_active_status or "") == "nt-managing":
-            active_patch_payload = _sanitize_bridge_active_trades_payload(
-                {
-                    "manage": row.get("manage"),
-                    "sl_level": row.get("sl_level"),
-                    "note": f"bridge:{setup_id}",
-                }
-            )
+            # Build payload without blindly sending sl_level
+            active_patch_payload = {
+                "manage": row.get("manage"),
+                "note": f"bridge:{setup_id}",
+            }
+
+            # Only send sl_level if it actually changed
+            current_sl = row.get("sl_level")
+
+            patch_key = f"{setup_id}:{leg}:{trade}"
+            last_payload = _BRIDGE_ACTIVE_PATCH_LAST.get(patch_key, {})
+            last_sl = last_payload.get("sl_level")
+
+            if current_sl is not None and current_sl != last_sl:
+                active_patch_payload["sl_level"] = current_sl
+
+            active_patch_payload = _sanitize_bridge_active_trades_payload(active_patch_payload)
             should_patch_active = bool(active_patch_payload)
 
         patch_key = f"{setup_id}:{leg}:{trade}"
