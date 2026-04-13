@@ -1200,7 +1200,13 @@ async def _sync_master_strategies_table(client: httpx.AsyncClient) -> None:
     headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
 
     if payload:
-        r = await client.post(endpoint, headers=headers, json=payload, timeout=30.0)
+        r = await client.post(
+            endpoint,
+            headers=headers,
+            params={"on_conflict": "strategy_key"},
+            json=payload,
+            timeout=30.0,
+        )
         r.raise_for_status()
 
         csv_values = ",".join(f'"{strategy_id}"' for strategy_id in strategy_ids)
