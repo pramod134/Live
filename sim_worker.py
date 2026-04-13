@@ -1849,8 +1849,8 @@ async def main() -> int:
         try:
             await _sync_master_strategies_table(client)
         except Exception as e:
-            logger.exception("failed to sync master_strategies at startup: %s", e)
-            return 1
+            print(f"[SIM_WORKER][STARTUP_SYNC_ERROR] {type(e).__name__}: {e}")
+
 
         poll_s = _supervisor_poll_seconds()
         running_children: Dict[str, Dict[str, Any]] = {}
