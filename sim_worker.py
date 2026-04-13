@@ -14,6 +14,7 @@ import re
 
 import httpx
 from zoneinfo import ZoneInfo
+from strategies import get_available_strategy_ids
 
 from candle_engine import CandleEngine, is_rth_now
 from indicator_bot import IndicatorBot
@@ -380,6 +381,22 @@ async def _sb_insert(
     hdrs = _sb_headers(key)
     hdrs["Prefer"] = f"return={returning}"
     r = await client.post(endpoint, headers=hdrs, json=payload, timeout=30.0)
+    r.raise_for_status()
+    return r.json() if r.text else None
+
+async def _sb_delete(
+    client: httpx.AsyncClient,
+    base_url: str,
+    key: str,
+    table: str,
+    params: Dict[str, str],
+    *,
+    returning: str = "minimal",
+) -> Any:
+    endpoint = f"{base_url}/rest/v1/{table}"
+    hdrs = _sb_headers(key)
+    hdrs["Prefer"] = f"return={returning}"
+    r = await client.delete(endpoint, headers=hdrs, params=params, timeout=30.0)
     r.raise_for_status()
     return r.json() if r.text else None
 
@@ -1148,6 +1165,73 @@ async def _list_live_ticker_rows(client: httpx.AsyncClient) -> list[Dict[str, An
     return out
 
 
+async def _fetch_live_ticker_strategy_config(
+    client: httpx.AsyncClient,
+    *,
+    symbol_db: str,
+) -> Optional[Dict[str, Any]]:
+    base_url, key = _sb_env()
+    row = await _sb_select_one(
+        client,
+        base_url,
+        key,
+        "live_ticker",
+        params={
+            "select": "run_strategy,selected_strategy",
+            "symbol": f"eq.{symbol_db}",
+            "limit": "1",
+        },
+    )
+    if not row:
+        return None
+    return {
+        "run_strategy": bool(row.get("run_strategy")),
+        "selected_strategy": str(row.get("selected_strategy") or "").strip() or None,
+    }
+
+
+async def _sync_master_strategies_table(client: httpx.AsyncClient) -> None:
+    base_url, key = _sb_env()
+    strategy_ids = [str(x).strip() for x in get_available_strategy_ids() if str(x).strip()]
+    payload = [{"strategy_key": strategy_id, "is_enabled": True} for strategy_id in strategy_ids]
+
+    endpoint = f"{base_url}/rest/v1/master_strategies"
+    headers = _sb_headers(key)
+    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+
+    if payload:
+        r = await client.post(endpoint, headers=headers, json=payload, timeout=30.0)
+        r.raise_for_status()
+
+        csv_values = ",".join(f'"{strategy_id}"' for strategy_id in strategy_ids)
+        await _sb_delete(
+            client,
+            base_url,
+            key,
+            "master_strategies",
+            params={"strategy_key": f"not.in.({csv_values})"},
+            returning="minimal",
+        )
+    else:
+        await _sb_delete(
+            client,
+            base_url,
+            key,
+            "master_strategies",
+            params={},
+            returning="minimal",
+        )
+
+
+def _apply_runtime_strategy_config(bot: IndicatorBot, symbol: str, config: Optional[Dict[str, Any]]) -> None:
+    cfg = config or {}
+    bot.set_strategy_runtime(
+        symbol=symbol,
+        run_strategy=cfg.get("run_strategy", False),
+        selected_strategy=cfg.get("selected_strategy"),
+    )
+
+
 async def _start_job_row(client: httpx.AsyncClient, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Mark a live_ticker row as running and assign a fresh run_id,
@@ -1338,6 +1422,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
 
             # Indicator bot in simulation mode (no DB writes)
             bot = IndicatorBot(engine=engine, sim_mode=True)
+            _apply_runtime_strategy_config(bot, symbol, job)
 
             # Seed counts, configurable via env vars (SEED_*_CANDLES)
             seed_counts = _load_seed_counts_from_env()
@@ -1494,6 +1579,12 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 if not is_rth_now():
                     await asyncio.sleep(max(5.0, poll_sleep_s))
                     continue
+
+                latest_strategy_cfg = await _fetch_live_ticker_strategy_config(
+                    client,
+                    symbol_db=symbol_db,
+                )
+                _apply_runtime_strategy_config(bot, symbol, latest_strategy_cfg)
 
                 live_rows = await _fetch_new_rth_1m_rows(
                     engine=engine,
@@ -1755,6 +1846,11 @@ async def main() -> int:
                 logger.error("claimed job not found symbol=%s run_id=%s", child_symbol, child_run_id)
                 return 1
             return await _run_claimed_job(client, claimed)
+        try:
+            await _sync_master_strategies_table(client)
+        except Exception as e:
+            logger.exception("failed to sync master_strategies at startup: %s", e)
+            return 1
 
         poll_s = _supervisor_poll_seconds()
         running_children: Dict[str, Dict[str, Any]] = {}
