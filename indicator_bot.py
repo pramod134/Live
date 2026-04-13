@@ -694,6 +694,7 @@ class IndicatorBot:
             self._candle_window_mode = "compound"
         self._fixed_window_default: int = max(0, int(os.getenv("INDICATOR_FIXED_CANDLES", "0") or "0"))
         self._fixed_window_by_tf: Dict[str, int] = {}
+        self._strategy_runtime_by_symbol: Dict[str, Dict[str, Any]] = {}
         for tf in SUPPORTED_TFS:
             env_name = f"INDICATOR_FIXED_CANDLES_{tf.upper()}"
             raw = os.getenv(env_name)
@@ -707,6 +708,15 @@ class IndicatorBot:
     # ------------------------------------------------------------------ #
     # Simulation entrypoints (sim_worker depends on these)
     # ------------------------------------------------------------------ #
+
+    def set_strategy_runtime(self, symbol: str, run_strategy: Any, selected_strategy: Any) -> None:
+        sym = (symbol or "").upper()
+        if not sym:
+            return
+        self._strategy_runtime_by_symbol[sym] = {
+            "run_strategy": bool(run_strategy),
+            "selected_strategy": str(selected_strategy or "").strip() or None,
+        }
 
     def _window_candles(self, timeframe: str, candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self._candle_window_mode != "fixed":
@@ -1138,6 +1148,7 @@ class IndicatorBot:
     
             # Now write to DB (and update caches)
             spot_last_candle = ((pending.get("1m") or {}).get("last_candle") if isinstance(pending, dict) else None)
+            runtime_cfg = self._strategy_runtime_by_symbol.get(sym_upper, {})
             for tf, pack in pending.items():
                 snapshot = pack["snapshot"]
                 last_candle = pack["last_candle"]
@@ -1173,6 +1184,8 @@ class IndicatorBot:
                         for k, v in (snap_map or {}).items()
                         if isinstance(v, dict)
                     },
+                    run_strategy=runtime_cfg.get("run_strategy"),
+                    selected_strategy=runtime_cfg.get("selected_strategy"),
                     spot_last_candle=spot_last_candle,
                 )
                 self._record_perf("strategy_eval", time.perf_counter() - t0, tf=tf)

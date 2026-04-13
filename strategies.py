@@ -3,6 +3,11 @@ from strategy_bos_fvg_ltf_sim import evaluate_bos_fvg_ltf as evaluate_bos_fvg_lt
 from typing import Dict, Any, List, Optional
 import os
 
+AVAILABLE_STRATEGY_IDS = (
+    "bos_fvg_ltf_sim",
+    "bos_fvg_ltf",
+)
+
 
 def _safe_float(value: Any) -> Optional[float]:
     try:
@@ -19,6 +24,9 @@ def _extract_level_price(level: Dict[str, Any]) -> Optional[float]:
         if p is not None:
             return p
     return None
+
+def get_available_strategy_ids() -> List[str]:
+    return list(AVAILABLE_STRATEGY_IDS)
 
 
 def _get_enabled_strategies_from_env() -> Optional[set]:
@@ -456,13 +464,26 @@ def evaluate_strategies(
     htf_swings: Optional[List[Dict[str, Any]]] = None,
     structure_states_by_tf: Optional[Dict[str, Any]] = None,
     spot_last_candle: Optional[Dict[str, Any]] = None,
+    run_strategy: Optional[bool] = None,
+    selected_strategy: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Evaluate enabled strategies for this symbol/timeframe.
     Currently only BOS+FVG Score V1 is enabled.
     """
     strategies: List[Dict[str, Any]] = []
-    enabled = _get_enabled_strategies_from_env()
+    if run_strategy is False:
+        return strategies
+
+    selected_strategy_norm = str(selected_strategy or "").strip().lower()
+
+    if run_strategy is True and not selected_strategy_norm:
+        return strategies
+
+    if selected_strategy_norm:
+        enabled = {selected_strategy_norm}
+    else:
+        enabled = _get_enabled_strategies_from_env()
 
     def strategy_enabled(strategy_id: str) -> bool:
         return enabled is None or strategy_id in enabled
