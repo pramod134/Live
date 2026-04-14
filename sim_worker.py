@@ -619,6 +619,12 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
                 )
                 _BRIDGE_ACTIVE_PATCH_LAST[patch_key] = dict(active_patch_payload)
                 print(f"[BOS_FVG_BRIDGE][DB_APPLIED] action=patch table=active_trades id={setup_id} leg={leg} trade={trade}")
+                if active_patch_payload.get("manage") == "C":
+                    try:
+                        from strategy_bos_fvg_ltf import apply_live_bridge_manage_c_db_applied
+                        apply_live_bridge_manage_c_db_applied(setup_id, leg, trade)
+                    except Exception:
+                        pass
             except httpx.HTTPStatusError as e:
                 body = (e.response.text if e.response is not None else str(e))[:240]
                 print(f"[BOS_FVG_BRIDGE][WARN] table=active_trades id={setup_id} leg={leg} trade={trade} err={body}")
