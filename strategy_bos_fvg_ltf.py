@@ -548,6 +548,48 @@ def _bridge_counts(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _begin_manage_c_cleanup(
+    state: Dict[str, Any],
+    *,
+    setup_id: str,
+    source: str,
+    rows: List[Dict[str, Any]],
+    clear_pending_setup: bool,
+) -> None:
+    setup_meta = (state.get("bridge_setup_index") or {}).get(setup_id) or {}
+    targets = {
+        (_safe_int(r.get("leg"), 0), _safe_int(r.get("trade"), 0))
+        for r in (rows or [])
+        if _safe_int(r.get("leg"), 0) > 0 and _safe_int(r.get("trade"), 0) > 0
+    }
+    if not targets:
+        return
+    setup_meta["cleanup_manage_c_pending"] = {
+        "source": source,
+        "targets": targets,
+        "acked": set(),
+        "clear_pending_setup": bool(clear_pending_setup),
+    }
+
+
+def _finalize_manage_c_cleanup(
+    state: Dict[str, Any],
+    *,
+    setup_id: str,
+) -> None:
+    setup_meta = (state.get("bridge_setup_index") or {}).get(setup_id) or {}
+    cleanup_meta = setup_meta.get("cleanup_manage_c_pending") or {}
+    if cleanup_meta.get("clear_pending_setup"):
+        pending = state.get("pending_setup")
+        if pending and pending.get("setup_id") == setup_id:
+            state["pending_setup"] = None
+    setup_meta["bridge_live_phase_entered"] = False
+    if state.get("bridge_current_setup_id") == setup_id:
+        state["bridge_current_setup_id"] = None
+    state["bridge_eod_close_sent"].pop(setup_id, None)
+    setup_meta.pop("cleanup_manage_c_pending", None)
+
+
 def get_live_bridge_rows() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for state in _BOS_FVG_LTF_STATE.values():
@@ -578,6 +620,26 @@ def apply_live_bridge_db_state(updates: List[Dict[str, Any]]) -> None:
             row["db_active_seen"] = bool(incoming.get("db_active_seen", False))
             row["db_active_status"] = incoming.get("db_active_status")
             row["db_active_manage"] = incoming.get("db_active_manage")
+
+
+def apply_live_bridge_manage_c_db_applied(setup_id: str, leg: Any, trade: Any) -> None:
+    setup_id_s = str(setup_id or "").strip()
+    leg_i = _safe_int(leg, 0)
+    trade_i = _safe_int(trade, 0)
+    if not setup_id_s or leg_i <= 0 or trade_i <= 0:
+        return
+    for state in _BOS_FVG_LTF_STATE.values():
+        setup_meta = (state.get("bridge_setup_index") or {}).get(setup_id_s) or {}
+        cleanup_meta = setup_meta.get("cleanup_manage_c_pending")
+        if not cleanup_meta:
+            continue
+        targets = cleanup_meta.get("targets") or set()
+        if (leg_i, trade_i) not in targets:
+            continue
+        acked = cleanup_meta.setdefault("acked", set())
+        acked.add((leg_i, trade_i))
+        if acked >= targets:
+            _finalize_manage_c_cleanup(state, setup_id=setup_id_s)
 
 
 def _normalize_fvg_direction(v: Any) -> str:
@@ -953,102 +1015,6 @@ def evaluate_bos_fvg_ltf(
             status = "live"
             skip_reason = ""
 
-    # ------------------------------------------------------------
-    # Phase 2 cancel-confirmation handling (runs every candle)
-    # ------------------------------------------------------------
-    # If Phase 2 case 2 already requested manage="C" on the current setup,
-    # do NOT wait for rows to be removed. Only wait for DB-fed confirmation
-    # that the waiting rows for this setup have db_active_manage == "C".
-    # Once confirmed, clear the old setup so the orchestrator can move back
-    # to Phase 1 and allow the rearm candidate to become the new pending setup.
-    pending = state.get("pending_setup")
-    if pending and bool(pending.get("cancel_requested")) and pending.get("setup_id"):
-        setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
-        local_manage_c_rows = [r for r in setup_rows if str(r.get("manage") or "") == "C"]
-        local_waiting_c_rows = [
-            r for r in local_manage_c_rows
-            if str(r.get("db_active_status") or "") in {"", "nt-waiting", "null", "None"}
-        ]
-        local_waiting_keys = {
-            (_safe_int(r.get("leg"), 0), _safe_int(r.get("trade"), 0))
-            for r in local_waiting_c_rows
-        }
-        # Only rows that were actually seen in DB matter for confirmation.
-        seen_rows = [r for r in setup_rows if r.get("db_active_seen")]
-        waiting_rows = [r for r in seen_rows if r.get("db_active_status") == "nt-waiting"]
-        seen_waiting_keys = {
-            (_safe_int(r.get("leg"), 0), _safe_int(r.get("trade"), 0))
-            for r in waiting_rows
-        }
-        missing_waiting_keys = local_waiting_keys - seen_waiting_keys
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "phase2_cancel_check",
-                trade_id=pending.get("trade_id"),
-                setup_id=pending.get("setup_id"),
-                cancel_requested=bool(pending.get("cancel_requested")),
-                local_manage_c_rows=len(local_manage_c_rows),
-                local_waiting_c_rows=len(local_waiting_c_rows),
-                setup_rows=len(setup_rows),
-                seen_rows=len(seen_rows),
-                waiting_rows=len(waiting_rows),
-                db_manage_c_waiting=sum(
-                    1 for r in waiting_rows if str(r.get("db_active_manage") or "") == "C"
-                ),
-                missing_waiting_rows_after_cancel=len(missing_waiting_keys),
-                bridge_current_setup_id=state.get("bridge_current_setup_id"),
-            )
-
-        cancel_confirmed = False
-
-        # Path 1: DB still shows waiting rows and all of them reflect manage=C.
-        if seen_rows and waiting_rows and all(
-            str(r.get("db_active_manage") or "") == "C"
-            for r in waiting_rows
-        ):
-            cancel_confirmed = True
-
-        # Path 2: we requested local manage=C, and DB no longer shows any waiting
-        # rows for the rows we attempted to cancel. This includes the case where
-        # those rows were removed immediately by the trading manager.
-        if local_waiting_c_rows and not waiting_rows:
-            cancel_confirmed = True
-
-        # Path 3: partial disappearance is also enough. If some or all of the
-        # waiting rows that were marked C locally are no longer surfaced as
-        # waiting rows in DB, treat that as confirmation.
-        if local_waiting_c_rows and missing_waiting_keys:
-            cancel_confirmed = True
-
-        # Path 4: if the setup no longer has any surfaced active state after we
-        # requested cancel, also treat that as confirmed enough to rearm.
-        if local_manage_c_rows and not seen_rows:
-            cancel_confirmed = True
-
-        if cancel_confirmed:
-            if DEBUG_LOGS:
-                print(
-                    f"[BOS-FVG-DB] phase2 cancel confirmed | Symbol={symbol} | TF={timeframe} | "
-                    f"TradeID={pending.get('trade_id')} | SetupID={pending.get('setup_id')}"
-                )
-            state["pending_setup"] = None
-            state["pending_rearm_setup"] = state.get("pending_rearm_setup")
-            # Release current bridge pointer so the next setup can become current.
-            if state.get("bridge_current_setup_id") == pending.get("setup_id"):
-                state["bridge_current_setup_id"] = None
-            setup_meta = (state.get("bridge_setup_index") or {}).get(pending.get("setup_id")) or {}
-            setup_meta["bridge_live_phase_entered"] = False
-            pending = None
-            if DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "phase2_to_phase1_rearm_ready",
-                    source="cancel_confirmed",
-                )
-
     # Setup state management
     if cfg["enabled"] and chosen_bos_detected and chosen_score_pass and cfg["max_open_positions"] >= 1:
         pending = state["pending_setup"]
@@ -1146,7 +1112,15 @@ def evaluate_bos_fvg_ltf(
                                 for r in waiting_rows
                             ),
                         )
-                    _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
+                    changed = _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
+                    if changed:
+                        _begin_manage_c_cleanup(
+                            state,
+                            setup_id=pending.get("setup_id"),
+                            source="phase2_case2_cancel",
+                            rows=waiting_rows,
+                            clear_pending_setup=True,
+                        )
                     pending["cancel_requested"] = True
                 else:
                     if DEBUG_LOGS:
@@ -1532,17 +1506,19 @@ def evaluate_bos_fvg_ltf(
                 **_bridge_counts(bridge_rows),
             )
         if live_phase_entered and has_active and not has_managing:
-            waiting_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
-            waiting_uncancelled = [r for r in waiting_rows if str(r.get("db_active_manage") or "") != "C"]
             cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
             changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
-            if changed and DEBUG_LOGS:
-                _db_state_log(symbol, timeframe, "phase3_cancel_request_sent", bridge_current_setup_id=bridge_setup_id, waiting_rows=len(cancel_rows))
-
-            # Do NOT rely on canceled rows remaining queryable after manage="C".
-            # If there are no live rows left, and either no waiting rows remain or
-            # no waiting rows remain uncancelled, Phase 3 cleanup is complete.
-            if not waiting_rows:
+            if changed:
+                _begin_manage_c_cleanup(
+                    state,
+                    setup_id=bridge_setup_id,
+                    source="phase3_no_live_rows",
+                    rows=cancel_rows,
+                    clear_pending_setup=False,
+                )
+                if DEBUG_LOGS:
+                    _db_state_log(symbol, timeframe, "phase3_cancel_request_sent", bridge_current_setup_id=bridge_setup_id, waiting_rows=len(cancel_rows))
+            elif not cancel_rows:
                 if DEBUG_LOGS:
                     _db_state_log(
                         symbol, timeframe, "phase3_complete_no_rows_remaining",
@@ -1552,22 +1528,7 @@ def evaluate_bos_fvg_ltf(
                 if state.get("bridge_current_setup_id") == bridge_setup_id:
                     state["bridge_current_setup_id"] = None
                 state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
-            elif not waiting_uncancelled:
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol, timeframe, "phase3_cleanup_confirmed",
-                        bridge_current_setup_id=bridge_setup_id,
-                        waiting_rows=len(waiting_rows)
-                    )
-                bridge_setup_meta["bridge_live_phase_entered"] = False
-                if state.get("bridge_current_setup_id") == bridge_setup_id:
-                    state["bridge_current_setup_id"] = None
-                state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
-
             else:
-                # Keep Phase 3 marked entered until cleanup is actually confirmed
-                # by disappearance / no waiting rows / all waiting rows surfaced
-                # as already canceled in DB.
                 bridge_setup_meta["bridge_live_phase_entered"] = True
 
     if not cfg["enabled"]:
