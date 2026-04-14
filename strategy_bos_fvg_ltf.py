@@ -1505,20 +1505,8 @@ def evaluate_bos_fvg_ltf(
                 live_phase_entered=live_phase_entered,
                 **_bridge_counts(bridge_rows),
             )
-        if live_phase_entered and has_active and not has_managing:
-            cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
-            changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
-            if changed:
-                _begin_manage_c_cleanup(
-                    state,
-                    setup_id=bridge_setup_id,
-                    source="phase3_no_live_rows",
-                    rows=cancel_rows,
-                    clear_pending_setup=False,
-                )
-                if DEBUG_LOGS:
-                    _db_state_log(symbol, timeframe, "phase3_cancel_request_sent", bridge_current_setup_id=bridge_setup_id, waiting_rows=len(cancel_rows))
-            elif not cancel_rows:
+        if live_phase_entered and not has_managing:
+            if not has_active:
                 if DEBUG_LOGS:
                     _db_state_log(
                         symbol, timeframe, "phase3_complete_no_rows_remaining",
@@ -1529,7 +1517,30 @@ def evaluate_bos_fvg_ltf(
                     state["bridge_current_setup_id"] = None
                 state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
             else:
-                bridge_setup_meta["bridge_live_phase_entered"] = True
+                cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
+                changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
+                if changed:
+                    _begin_manage_c_cleanup(
+                        state,
+                        setup_id=bridge_setup_id,
+                        source="phase3_no_live_rows",
+                        rows=cancel_rows,
+                        clear_pending_setup=False,
+                    )
+                    if DEBUG_LOGS:
+                        _db_state_log(symbol, timeframe, "phase3_cancel_request_sent", bridge_current_setup_id=bridge_setup_id, waiting_rows=len(cancel_rows))
+                elif not cancel_rows:
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol, timeframe, "phase3_complete_no_rows_remaining",
+                            bridge_current_setup_id=bridge_setup_id
+                        )
+                    bridge_setup_meta["bridge_live_phase_entered"] = False
+                    if state.get("bridge_current_setup_id") == bridge_setup_id:
+                        state["bridge_current_setup_id"] = None
+                    state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
+                else:
+                    bridge_setup_meta["bridge_live_phase_entered"] = True
 
     if not cfg["enabled"]:
         status = "disabled"
