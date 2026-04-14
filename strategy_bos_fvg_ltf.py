@@ -182,6 +182,12 @@ def _as_et_str(ts_value: Any) -> Optional[str]:
     return dt.astimezone(_ET).isoformat()
 
 
+def _insert_day_end_time_utc_iso() -> str:
+    now_et = datetime.now(_ET)
+    end_et = now_et.replace(hour=15, minute=56, second=0, microsecond=0)
+    return end_et.astimezone(ZoneInfo("UTC")).isoformat()
+
+
 def _latest_swing(swings: Dict[str, Any], swing_type: str, current_ts: Optional[datetime]) -> Optional[Dict[str, Any]]:
     swing_items = (swings or {}).get("swings") or []
     latest = None
@@ -303,6 +309,7 @@ def _bridge_insert_rows(
     cp = "call" if side == "long" else "put"
     sl_cond = "cb" if side == "long" else "ca"
     sl_level = fvg_low if side == "long" else fvg_high
+    end_time = _insert_day_end_time_utc_iso()
     fvg_mid = None
     if fvg_high is not None and fvg_low is not None:
         fvg_mid = (_safe_float(fvg_high, 0.0) + _safe_float(fvg_low, 0.0)) / 2.0
@@ -349,6 +356,7 @@ def _bridge_insert_rows(
                 "sl_tf": timeframe,
                 "tp_type": None,
                 "tp_level": None,
+                "end_time": end_time,
                 "status": "nt-waiting",
                 "manage": None,
                 "db_new_insert_confirmed": False,
@@ -1437,24 +1445,6 @@ def evaluate_bos_fvg_ltf(
                 managing_trade1=len(managing_trade1),
                 managing_trade2=len(managing_trade2),
             )
-
-    # EOD close request at/after 15:56 ET for all surfaced active rows.
-    if bridge_setup_id and bridge_rows and _is_eod_close_time(last_ts):
-        if not state["bridge_eod_close_sent"].get(bridge_setup_id):
-            active_rows_for_setup = [r for r in bridge_rows if bool(r.get("db_active_seen"))]
-            if active_rows_for_setup:
-                changed = _bridge_update_rows(active_rows_for_setup, {"manage": "C"}, "eod_close_1556")
-                if changed:
-                    state["bridge_eod_close_sent"][bridge_setup_id] = True
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol,
-                            timeframe,
-                            "eod_close_request_sent",
-                            bridge_current_setup_id=bridge_setup_id,
-                            active_rows=len(active_rows_for_setup),
-                            changed_rows=changed,
-                        )
 
     # Phase 3 SL management
     # Longs use swing lows; shorts use swing highs.
