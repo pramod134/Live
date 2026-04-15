@@ -590,6 +590,52 @@ def _finalize_manage_c_cleanup(
         state["bridge_current_setup_id"] = None
     state["bridge_eod_close_sent"].pop(setup_id, None)
     setup_meta.pop("cleanup_manage_c_pending", None)
+    rearm = state.get("pending_rearm_setup")
+    if rearm and not state.get("pending_setup"):
+        existing_rows = setup_meta.get("rows") or []
+        symbol = str((existing_rows[0] if existing_rows else {}).get("symbol") or "")
+        timeframe = str((existing_rows[0] if existing_rows else {}).get("entry_tf") or "")
+        if symbol and timeframe:
+            state["trade_id_counter"] += 1
+            trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
+            top_shares = ENTRY_LEG_SHARES * 2
+            mid_shares = ENTRY_LEG_SHARES * 4
+            bottom_shares = ENTRY_LEG_SHARES * 6
+            total_shares = top_shares + mid_shares + bottom_shares
+            state["pending_setup"] = {
+                "trade_id": trade_id,
+                "side": rearm.get("side"),
+                "bos_ts": rearm.get("bos_ts"),
+                "bos_ts_et": rearm.get("bos_ts_et"),
+                "shares_total": total_shares,
+                "entry_top_shares": top_shares,
+                "entry_mid_shares": mid_shares,
+                "entry_bottom_shares": bottom_shares,
+                "entry_ref_swing_high": rearm.get("entry_ref_swing_high"),
+                "entry_ref_swing_high_ts": rearm.get("entry_ref_swing_high_ts"),
+                "entry_ref_swing_high_score": rearm.get("entry_ref_swing_high_score"),
+                "entry_ref_swing_low": rearm.get("entry_ref_swing_low"),
+                "entry_ref_swing_low_ts": rearm.get("entry_ref_swing_low_ts"),
+                "entry_ref_swing_low_score": rearm.get("entry_ref_swing_low_score"),
+                "score_total": rearm.get("score_total"),
+                "score_pass": rearm.get("score_pass"),
+                "momentum_pass": rearm.get("momentum_pass"),
+                "volume_pass": rearm.get("volume_pass"),
+                "close_pass": rearm.get("close_pass"),
+                "break_pass": rearm.get("break_pass"),
+                "mom_value": rearm.get("mom_value"),
+                "vol_value": rearm.get("vol_value"),
+                "close_strength_value": rearm.get("close_strength_value"),
+                "break_distance_value": rearm.get("break_distance_value"),
+                "structure_state_tf": rearm.get("structure_state_tf"),
+                "structure_state_15m": rearm.get("structure_state_15m"),
+                "structure_state_1h": rearm.get("structure_state_1h"),
+                "fvg": None,
+                "setup_id": None,
+                "cancel_requested": False,
+                "notes": "promoted_from_rearm_after_manage_c_db_applied",
+            }
+            state["pending_rearm_setup"] = None
 
 
 def get_live_bridge_rows() -> List[Dict[str, Any]]:
