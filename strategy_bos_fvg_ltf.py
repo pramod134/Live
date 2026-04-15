@@ -1042,6 +1042,12 @@ def evaluate_bos_fvg_ltf(
                 strategy_name="bos_fvg_ltf",
                 version=BRIDGE_VERSION,
             )
+            pending_setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
+            awaiting_insert_confirmation = bool(
+                pending.get("setup_id")
+                and pending_setup_rows
+                and not all(bool(r.get("db_new_insert_confirmed")) for r in pending_setup_rows)
+            )
             if DEBUG_LOGS:
                 scope_dbg = _bridge_counts(scope_rows)
                 _db_state_log(
@@ -1057,7 +1063,18 @@ def evaluate_bos_fvg_ltf(
                     **_rearm_summary(state.get("pending_rearm_setup")),
                 )
             has_live_rows = any(r.get("db_active_status") == "nt-managing" for r in scope_rows)
-            if not has_live_rows:
+            if awaiting_insert_confirmation:
+                if DEBUG_LOGS:
+                    _db_state_log(
+                        symbol,
+                        timeframe,
+                        "phase2_rearm_blocked_awaiting_new_trades_insert_confirmation",
+                        trade_id=pending.get("trade_id"),
+                        setup_id=pending.get("setup_id"),
+                        confirmed_rows=sum(1 for r in pending_setup_rows if bool(r.get("db_new_insert_confirmed"))),
+                        total_rows=len(pending_setup_rows),
+                    )
+            elif not has_live_rows:
                 state["pending_rearm_setup"] = {
                     "side": chosen_side,
                     "bos_ts": last_ts,
