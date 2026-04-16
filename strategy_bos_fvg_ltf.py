@@ -239,6 +239,7 @@ def _ensure_state(symbol: str, timeframe: str) -> Dict[str, Any]:
             "config": cfg,
             "pending_setup": None,
             "pending_rearm_setup": None,
+            "deferred_bos": None,
             "broken_swing_highs": set(),
             "broken_swing_lows": set(),
             "trade_id_counter": 0,
@@ -535,6 +536,20 @@ def _rearm_summary(rearm: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "rearm_exists": True,
         "rearm_side": rearm.get("side"),
         "rearm_bos_ts": rearm.get("bos_ts"),
+    }
+
+
+def _deferred_bos_summary(deferred: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(deferred, dict):
+        return {
+            "deferred_bos_exists": False,
+            "deferred_bos_side": None,
+            "deferred_bos_ts": None,
+        }
+    return {
+        "deferred_bos_exists": True,
+        "deferred_bos_side": deferred.get("side"),
+        "deferred_bos_ts": deferred.get("bos_ts"),
     }
 
 
@@ -933,12 +948,40 @@ def evaluate_bos_fvg_ltf(
         chosen_close_strength = close_strength_short
         chosen_break_distance = break_distance_short
 
+    candidate_bos: Optional[Dict[str, Any]] = None
+    if cfg["enabled"] and chosen_bos_detected and chosen_score_pass:
+        candidate_bos = {
+            "side": chosen_side,
+            "bos_ts": last_ts,
+            "bos_ts_et": last_ts_et,
+            "entry_ref_swing_high": recent_high_price,
+            "entry_ref_swing_high_ts": recent_high_ts,
+            "entry_ref_swing_high_score": recent_high_pivot_score,
+            "entry_ref_swing_low": recent_low_price,
+            "entry_ref_swing_low_ts": recent_low_ts,
+            "entry_ref_swing_low_score": recent_low_pivot_score,
+            "score_total": chosen_score_total,
+            "score_pass": chosen_score_pass,
+            "momentum_pass": chosen_momentum_pass,
+            "volume_pass": chosen_volume_pass,
+            "close_pass": chosen_close_pass,
+            "break_pass": chosen_break_pass,
+            "mom_value": mom_val,
+            "vol_value": vol_val,
+            "close_strength_value": chosen_close_strength,
+            "break_distance_value": chosen_break_distance,
+            "structure_state_tf": structure_state_tf,
+            "structure_state_15m": structure_state_15m,
+            "structure_state_1h": structure_state_1h,
+        }
+
     status = "idle"
     skip_reason = ""
 
     if DEBUG_LOGS:
         pending_dbg = _pending_summary(state.get("pending_setup"))
         rearm_dbg = _rearm_summary(state.get("pending_rearm_setup"))
+        deferred_dbg = _deferred_bos_summary(state.get("deferred_bos"))
         _db_state_log(
             symbol,
             timeframe,
@@ -951,6 +994,7 @@ def evaluate_bos_fvg_ltf(
             live_mode=live_mode,
             **pending_dbg,
             **rearm_dbg,
+            **deferred_dbg,
         )
 
     # ------------------------------------------------------------
@@ -1247,36 +1291,40 @@ def evaluate_bos_fvg_ltf(
                     bridge_blocks_new_setup = True
                     bridge_block_reason = "phase3_cleanup_pending"
             if bridge_blocks_new_setup:
+                if (
+                    candidate_bos is not None
+                    and bridge_block_reason == "current_setup_live"
+                ):
+                    state["deferred_bos"] = deepcopy(candidate_bos)
+                    if DEBUG_LOGS:
+                        _db_state_log(
+                            symbol,
+                            timeframe,
+                            "live_bos_deferred",
+                            bridge_current_setup_id=current_bridge_setup_id,
+                            deferred_side=candidate_bos.get("side"),
+                            deferred_bos_ts=candidate_bos.get("bos_ts"),
+                            reason=bridge_block_reason,
+                        )
                 if DEBUG_LOGS:
                     _db_state_log(
                         symbol, timeframe, "new_setup_blocked_by_current_bridge_setup",
                         bridge_current_setup_id=current_bridge_setup_id, reason=bridge_block_reason, **_bridge_counts(current_bridge_rows)
                     )
                 rearm = None
-            candidate = rearm or {
-                "side": chosen_side,
-                "bos_ts": last_ts,
-                "bos_ts_et": last_ts_et,
-                "entry_ref_swing_high": recent_high_price,
-                "entry_ref_swing_high_ts": recent_high_ts,
-                "entry_ref_swing_high_score": recent_high_pivot_score,
-                "entry_ref_swing_low": recent_low_price,
-                "entry_ref_swing_low_ts": recent_low_ts,
-                "entry_ref_swing_low_score": recent_low_pivot_score,
-                "score_total": chosen_score_total,
-                "score_pass": chosen_score_pass,
-                "momentum_pass": chosen_momentum_pass,
-                "volume_pass": chosen_volume_pass,
-                "close_pass": chosen_close_pass,
-                "break_pass": chosen_break_pass,
-                "mom_value": mom_val,
-                "vol_value": vol_val,
-                "close_strength_value": chosen_close_strength,
-                "break_distance_value": chosen_break_distance,
-                "structure_state_tf": structure_state_tf,
-                "structure_state_15m": structure_state_15m,
-                "structure_state_1h": structure_state_1h,
-            } if (rearm is not None or not bridge_blocks_new_setup) else None
+            deferred = state.get("deferred_bos")
+            candidate = None
+            candidate_source = None
+
+            if rearm is not None:
+                candidate = rearm
+                candidate_source = "rearm"
+            elif deferred is not None and not bridge_blocks_new_setup:
+                candidate = deferred
+                candidate_source = "deferred_bos"
+            elif candidate_bos is not None and not bridge_blocks_new_setup:
+                candidate = candidate_bos
+                candidate_source = "current_bos"
             if candidate is not None:
                 state["trade_id_counter"] += 1
                 trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
@@ -1325,9 +1373,12 @@ def evaluate_bos_fvg_ltf(
                         trade_id=trade_id,
                         side=state["pending_setup"].get("side"),
                         bos_ts=state["pending_setup"].get("bos_ts"),
-                        source="rearm" if rearm else "current_bos",
+                        source=candidate_source,
                     )
-                state["pending_rearm_setup"] = None
+                if candidate_source == "rearm":
+                    state["pending_rearm_setup"] = None
+                elif candidate_source == "deferred_bos":
+                    state["deferred_bos"] = None
                 if DEBUG_LOGS:
                     print(
                         f"[BOS-FVG-DB] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
@@ -1626,6 +1677,7 @@ def evaluate_bos_fvg_ltf(
             skip_reason=skip_reason,
             **_pending_summary(state.get("pending_setup")),
             **_rearm_summary(state.get("pending_rearm_setup")),
+            **_deferred_bos_summary(state.get("deferred_bos")),
             bridge_current_setup_id=state.get("bridge_current_setup_id"),
         )
 
