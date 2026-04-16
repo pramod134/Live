@@ -129,6 +129,57 @@ async def update_indicators_in_spot_tf(
             # print(f"[INDICATORS][DB] Unexpected error for {symbol} {timeframe}: {e}")
 
 
+async def update_tick_tf(
+    symbol: str,
+    timeframe: str,
+    payload: Dict[str, Any],
+) -> None:
+    """
+    Patch public.tick_tf for the given symbol+timeframe with only the fields
+    already available in payload. No synthetic/default filling.
+    """
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_KEY")
+    )
+
+    if not supabase_url or not supabase_key:
+        return
+
+    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/tick_tf"
+    params = {
+        "symbol": f"eq.{symbol}",
+        "timeframe": f"eq.{timeframe}",
+    }
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    body = dict(payload)
+    body["last_updated"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.patch(
+                endpoint,
+                params=params,
+                json=body,
+                headers=headers,
+            )
+            if resp.status_code >= 400:
+                resp.raise_for_status()
+        except httpx.HTTPError:
+            pass
+        except Exception:
+            pass
+
+
 async def fetch_spot_tf_rows_for_symbol(symbol: str) -> List[Dict[str, Any]]:
     """
     Fetch all spot_tf rows for a symbol across all timeframes.
@@ -784,6 +835,7 @@ class IndicatorBot:
             # Attach extras_advanced to the cached snapshot so downstream consumers
             # see the same "row shape" we would have written to spot_tf.
             snapshot["extras_advanced"] = advanced
+            snapshot["last_candle"] = last_candle
 
             self.last_snapshots[sym][tf] = snapshot
             self.last_processed_ts[sym][tf] = ts_dt
@@ -845,6 +897,42 @@ class IndicatorBot:
         except Exception as e:
             pass
             # print(f"[INDICATOR_BOT][DIAG] bootstrap liquidity pool build failed: {e}")
+
+    async def flush_tick_tf(self, symbol: str) -> None:
+        """
+        Write current cached per-timeframe state into tick_tf for this symbol.
+        Uses only fields already present in the snapshot.
+        """
+        sym = (symbol or "").upper()
+        snap_by_tf = self.last_snapshots.get(sym, {}) or {}
+        if not snap_by_tf:
+            return
+
+        for tf, snapshot in snap_by_tf.items():
+            if not isinstance(snapshot, dict):
+                continue
+
+            payload: Dict[str, Any] = {}
+
+            for key in (
+                "structure_state",
+                "swings",
+                "fvgs",
+                "liquidity",
+                "volume_profile",
+                "trend",
+                "extras",
+                "last_candle",
+                "strategies",
+                "extras_advanced",
+                "pivots",
+                "structural",
+            ):
+                if key in snapshot:
+                    payload[key] = snapshot.get(key)
+
+            if payload:
+                await update_tick_tf(symbol=sym, timeframe=tf, payload=payload)
 
     async def on_candle(self, symbol: str, timeframe: str, candle: Dict[str, Any]) -> None:
         """
@@ -1262,6 +1350,10 @@ class IndicatorBot:
                 except Exception:
                     pass
                 try:
+                    snapshot["last_candle"] = last_candle
+                except Exception:
+                    pass
+                try:
                     snapshot["strategies"] = strategies
                 except Exception:
                     pass
@@ -1281,6 +1373,27 @@ class IndicatorBot:
                 # Cache for next cycle's multi-TF enrichment
                 self.last_snapshots.setdefault(sym_upper, {})[tf] = snapshot
                 self.last_processed_ts.setdefault(sym_upper, {})[tf] = ts_dt
+
+                tick_payload: Dict[str, Any] = {}
+                for key in (
+                    "structure_state",
+                    "swings",
+                    "fvgs",
+                    "liquidity",
+                    "volume_profile",
+                    "trend",
+                    "extras",
+                    "last_candle",
+                    "strategies",
+                    "extras_advanced",
+                    "pivots",
+                    "structural",
+                ):
+                    if key in snapshot:
+                        tick_payload[key] = snapshot.get(key)
+
+                if tick_payload:
+                    await update_tick_tf(symbol=sym_upper, timeframe=tf, payload=tick_payload)
     
                 # (log removed) was too noisy during simulation troubleshooting
                 # print(

@@ -1568,6 +1568,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                     f"last_processed_ts={_ts_str(last_processed_ts)} | "
                     f"batches={catchup_batches} | rows_total={catchup_rows_total}"
                 )
+                await bot.flush_tick_tf(symbol)
             else:
                 print(
                     f"[SIM_WORKER] catchup_skipped_snapshot_resume | Symbol={symbol} | "
