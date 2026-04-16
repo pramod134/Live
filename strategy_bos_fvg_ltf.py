@@ -295,6 +295,9 @@ def _bridge_trade_log(action: str, row: Dict[str, Any], reason: str) -> None:
     )
 
 
+
+
+
 def _bridge_insert_rows(
     state: Dict[str, Any],
     symbol: str,
@@ -309,32 +312,61 @@ def _bridge_insert_rows(
     setup_id = _deterministic_setup_id(symbol, timeframe, bos_ts, version, side, fvg_high, fvg_low)
     if setup_id in state["bridge_setup_index"]:
         return None
+
     cp = "call" if side == "long" else "put"
     sl_cond = "cb" if side == "long" else "ca"
-    sl_level = fvg_low if side == "long" else fvg_high
-    end_time = _insert_day_end_time_utc_iso()
-    fvg_mid = None
-    if fvg_high is not None and fvg_low is not None:
-        fvg_mid = (_safe_float(fvg_high, 0.0) + _safe_float(fvg_low, 0.0)) / 2.0
 
-    # 3-leg ladder:
-    # longs  -> high(1), mid(2), low(3)
-    # shorts -> low(1), mid(2), high(3)
+    PRICE_BROADEN = 0.10
+    MIN_TRADE3_RISK = 0.60
+    TRADE3_RR_BY_LEG = {
+        1: 1.0,
+        2: 1.5,
+        3: 2.0,
+    }
+
+    raw_fvg_high = _safe_float(fvg_high)
+    raw_fvg_low = _safe_float(fvg_low)
+    end_time = _insert_day_end_time_utc_iso()
+
+    fvg_mid = None
+    if raw_fvg_high is not None and raw_fvg_low is not None:
+        fvg_mid = (raw_fvg_high + raw_fvg_low) / 2.0
+
+    # 3-leg ladder with broadened entry/SL levels:
+    # longs  -> entries at high+0.10, mid+0.10, low+0.10; stop at low-0.10
+    # shorts -> entries at low-0.10,  mid-0.10, high-0.10; stop at high+0.10
     if side == "long":
+        sl_level = (raw_fvg_low - PRICE_BROADEN) if raw_fvg_low is not None else None
         leg_levels = [
-            (1, _safe_float(fvg_high), 1),
-            (2, _safe_float(fvg_mid), 2),
-            (3, _safe_float(fvg_low), 3),
+            (1, (raw_fvg_high + PRICE_BROADEN) if raw_fvg_high is not None else None, 1),
+            (2, (fvg_mid + PRICE_BROADEN) if fvg_mid is not None else None, 2),
+            (3, (raw_fvg_low + PRICE_BROADEN) if raw_fvg_low is not None else None, 3),
         ]
     else:
+        sl_level = (raw_fvg_high + PRICE_BROADEN) if raw_fvg_high is not None else None
         leg_levels = [
-            (1, _safe_float(fvg_low), 1),
-            (2, _safe_float(fvg_mid), 2),
-            (3, _safe_float(fvg_high), 3),
+            (1, (raw_fvg_low - PRICE_BROADEN) if raw_fvg_low is not None else None, 1),
+            (2, (fvg_mid - PRICE_BROADEN) if fvg_mid is not None else None, 2),
+            (3, (raw_fvg_high - PRICE_BROADEN) if raw_fvg_high is not None else None, 3),
         ]
+
     rows: List[Dict[str, Any]] = []
     for leg, entry_level, qty_per_trade in leg_levels:
-        for trade in (1, 2):
+        for trade in (1, 2, 3):
+            tp_type = None
+            tp_level = None
+
+            # Trade 3 only: fixed TP, set-and-done. No special manage flag needed;
+            # existing maintenance code only touches trade 1 and trade 2.
+            if trade == 3 and entry_level is not None and sl_level is not None:
+                effective_risk = max(abs(entry_level - sl_level), MIN_TRADE3_RISK)
+                rr_mult = TRADE3_RR_BY_LEG.get(leg, 1.0)
+                if side == "long":
+                    tp_level = entry_level + (rr_mult * effective_risk)
+                else:
+                    tp_level = entry_level - (rr_mult * effective_risk)
+                tp_type = "equity"
+
             tags = [
                 f"strategy:{strategy_name}",
                 f"version:{version}",
@@ -343,6 +375,9 @@ def _bridge_insert_rows(
                 f"leg:{leg}",
                 f"trade:{trade}",
             ]
+            if trade == 3:
+                tags.append("exit:fixed_tp")
+
             row = {
                 "setup_id": setup_id,
                 "symbol": symbol,
@@ -357,8 +392,8 @@ def _bridge_insert_rows(
                 "sl_cond": sl_cond,
                 "sl_level": sl_level,
                 "sl_tf": timeframe,
-                "tp_type": None,
-                "tp_level": None,
+                "tp_type": tp_type,
+                "tp_level": tp_level,
                 "end_time": end_time,
                 "status": "nt-waiting",
                 "manage": None,
@@ -372,6 +407,7 @@ def _bridge_insert_rows(
             }
             rows.append(row)
             _bridge_trade_log("INSERT", row, "stage1_create")
+
     state["bridge_rows"].extend(rows)
     state["bridge_setup_index"][setup_id] = {
         "rows": rows,
