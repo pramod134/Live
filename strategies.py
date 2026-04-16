@@ -1,4 +1,5 @@
 from strategy_bos_fvg_ltf import evaluate_bos_fvg_ltf
+from strategy_bos_fvg_ltf_1q import evaluate_bos_fvg_ltf_1q
 from strategy_bos_fvg_ltf_sim import evaluate_bos_fvg_ltf as evaluate_bos_fvg_ltf_sim
 from typing import Dict, Any, List, Optional
 import os
@@ -6,6 +7,7 @@ import os
 AVAILABLE_STRATEGY_IDS = (
     "bos_fvg_ltf_sim",
     "bos_fvg_ltf",
+    "bos_fvg_ltf_1q",
 )
 
 
@@ -534,6 +536,32 @@ def evaluate_strategies(
         strategies.append(
             {
                 "id": "bos_fvg_ltf",
+                "timeframe": timeframe,
+                "status": "error",
+                "error": str(e),
+            }
+        )
+
+    # --- BOS+FVG LTF BRIDGE 1Q (all leg quantities fixed at 1) ---
+    try:
+        if strategy_enabled("bos_fvg_ltf_1q") and str(timeframe or "").lower() in {"1m", "3m", "5m"}:
+            bos_ltf_1q = evaluate_bos_fvg_ltf_1q(
+                symbol=symbol,
+                timeframe=timeframe,
+                candles=candles,
+                swings=swings,
+                structure_state_tf=(structure_states_by_tf or {}).get(timeframe),
+                structure_state_15m=(structure_states_by_tf or {}).get("15m"),
+                structure_state_1h=(structure_states_by_tf or {}).get("1h"),
+                fvgs=fvgs,
+                spot_last_candle=spot_last_candle,
+            )
+            if bos_ltf_1q:
+                strategies.append(bos_ltf_1q)
+    except Exception as e:
+        strategies.append(
+            {
+                "id": "bos_fvg_ltf_1q",
                 "timeframe": timeframe,
                 "status": "error",
                 "error": str(e),
