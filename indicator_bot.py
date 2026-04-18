@@ -500,9 +500,9 @@ def build_swings_lite(
     latest_swing_low = None
 
     for s in reversed(swings):
-        if latest_swing_high is None and s.get("type") == "swing_high":
+        if latest_swing_high is None and s.get("type") == "swing_high" and s.get("state") == "active":
             latest_swing_high = s
-        if latest_swing_low is None and s.get("type") == "swing_low":
+        if latest_swing_low is None and s.get("type") == "swing_low" and s.get("state") == "active":
             latest_swing_low = s
         if latest_swing_high is not None and latest_swing_low is not None:
             break
@@ -518,6 +518,9 @@ def build_swings_lite(
             try:
                 price = float(s.get("price"))
             except Exception:
+                continue
+
+            if s.get("state") != "active":
                 continue
 
             if s.get("type") == "swing_high" and price > latest_close:
@@ -568,6 +571,9 @@ def build_fvgs_lite(
     latest_bearish_fvg = None
 
     for f in reversed(items):
+        if f.get("filled") is True:
+            continue
+
         if latest_bullish_fvg is None and f.get("direction") == "bull":
             latest_bullish_fvg = f
         if latest_bearish_fvg is None and f.get("direction") == "bear":
@@ -587,6 +593,9 @@ def build_fvgs_lite(
                 low = float(f.get("low"))
                 high = float(f.get("high"))
             except Exception:
+                continue
+
+            if f.get("filled") is True:
                 continue
 
             if f.get("direction") == "bull" and low > latest_close:
@@ -841,6 +850,7 @@ class IndicatorBot:
     ):
         self.engine = engine
         self.timeframes = timeframes or list(SUPPORTED_TFS)
+        self.sim_mode = bool(sim_mode)
         # last_processed_ts[symbol][tf] -> datetime of last processed candle
         self.last_processed_ts: Dict[str, Dict[str, dt.datetime]] = {}
         # last_snapshots[symbol][tf] -> most recent snapshot dict (for multi-TF VP context)
@@ -1539,7 +1549,7 @@ class IndicatorBot:
                     if key in snapshot:
                         tick_payload[key] = snapshot.get(key)
 
-                if tick_payload:
+                if tick_payload and not self.sim_mode:
                     await update_tick_tf(symbol=sym_upper, timeframe=tf, payload=tick_payload)
     
                 # (log removed) was too noisy during simulation troubleshooting

@@ -1756,6 +1756,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
         logger.info("simulation cancelled for symbol=%s", symbol)
         msg = "cancelled"
         try:
+            await bot.flush_tick_tf(symbol)
             event_counters, event_candles = _build_event_payloads()
             parsed_tf_summaries = _parse_final_summary_lines(log_local_path)
             base_trades_summary, trades = _build_trades_payload(bot, symbol)
