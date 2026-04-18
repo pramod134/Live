@@ -48,7 +48,7 @@ async def update_indicators_in_spot_tf(
     trend: Dict[str, Any],
     pivots: Dict[str, Any],
     swings: Dict[str, Any],
-    swings_mini: Dict[str, Any],
+    swings_lite: Dict[str, Any],
     structural: Dict[str, Any],
     fvgs: List[Dict[str, Any]],
     fvgs_lite: Dict[str, Any],
@@ -94,7 +94,7 @@ async def update_indicators_in_spot_tf(
         "trend": trend,
         "pivots": pivots,
         "swings": swings,
-        "swings_mini": swings_mini,
+        "swings_lite": swings_lite,
         "structural": structural,
         "fvgs": fvgs,
         "fvgs_lite": fvgs_lite,
@@ -477,7 +477,7 @@ def _tf_to_timedelta(tf: str) -> Optional[dt.timedelta]:
     return None
 
 
-def build_swings_mini(
+def build_swings_lite(
     swings_obj: Dict[str, Any],
     last_candle: Optional[Dict[str, Any]],
     *,
@@ -1056,7 +1056,7 @@ class IndicatorBot:
             for key in (
                 "structure_state",
                 "swings",
-                "swings_mini",
+                "swings_lite",
                 "fvgs",
                 "fvgs_lite",
                 "liquidity",
@@ -1386,8 +1386,8 @@ class IndicatorBot:
                 trend = snapshot["trend"]
                 pivots = snapshot["pivots"]
                 swings = snapshot["swings"]
-                swings_mini = build_swings_mini(swings, last_candle)
-                snapshot["swings_mini"] = swings_mini
+                swings_lite = build_swings_lite(swings, last_candle)
+                snapshot["swings_lite"] = swings_lite
                 structural = snapshot["structural"]
                 fvgs = snapshot["fvgs"]
                 fvgs_lite = build_fvgs_lite(fvgs, last_candle)
@@ -1523,7 +1523,7 @@ class IndicatorBot:
                 for key in (
                     "structure_state",
                     "swings",
-                    "swings_mini",
+                    "swings_lite",
                     "fvgs",
                     "fvgs_lite",
                     "liquidity",
