@@ -51,6 +51,7 @@ async def update_indicators_in_spot_tf(
     swings_mini: Dict[str, Any],
     structural: Dict[str, Any],
     fvgs: List[Dict[str, Any]],
+    fvgs_lite: Dict[str, Any],
     liquidity: Dict[str, Any],
     volume_profile: Dict[str, Any],
     extras: Dict[str, Any],
@@ -96,6 +97,7 @@ async def update_indicators_in_spot_tf(
         "swings_mini": swings_mini,
         "structural": structural,
         "fvgs": fvgs,
+        "fvgs_lite": fvgs_lite,
         "liquidity": liquidity,
         "volume_profile": volume_profile,
         "extras": extras,
@@ -540,6 +542,73 @@ def build_swings_mini(
         "latest_swing_low": latest_swing_low,
         "swing_highs_above": swing_highs_above,
         "swing_lows_below": swing_lows_below,
+    }
+
+
+def build_fvgs_lite(
+    fvgs: List[Dict[str, Any]],
+    last_candle: Optional[Dict[str, Any]],
+    *,
+    n_above: int = 4,
+    n_below: int = 4,
+) -> Dict[str, Any]:
+    items = list(fvgs or [])
+
+    latest_close = None
+    ref_ts = None
+    if isinstance(last_candle, dict):
+        ref_ts = last_candle.get("ts")
+        try:
+            if last_candle.get("close") is not None:
+                latest_close = float(last_candle.get("close"))
+        except Exception:
+            latest_close = None
+
+    latest_bullish_fvg = None
+    latest_bearish_fvg = None
+
+    for f in reversed(items):
+        if latest_bullish_fvg is None and f.get("direction") == "bull":
+            latest_bullish_fvg = f
+        if latest_bearish_fvg is None and f.get("direction") == "bear":
+            latest_bearish_fvg = f
+        if latest_bullish_fvg is not None and latest_bearish_fvg is not None:
+            break
+
+    bullish_above: List[Dict[str, Any]] = []
+    bearish_below: List[Dict[str, Any]] = []
+
+    if latest_close is not None:
+        bulls = []
+        bears = []
+
+        for f in items:
+            try:
+                low = float(f.get("low"))
+                high = float(f.get("high"))
+            except Exception:
+                continue
+
+            if f.get("direction") == "bull" and low > latest_close:
+                bulls.append(f)
+            elif f.get("direction") == "bear" and high < latest_close:
+                bears.append(f)
+
+        bulls.sort(key=lambda x: float(x.get("low")) - latest_close)
+        bears.sort(key=lambda x: latest_close - float(x.get("high")))
+
+        bullish_above = bulls[:n_above]
+        bearish_below = bears[:n_below]
+
+    return {
+        "reference": {
+            "ts": ref_ts,
+            "close": latest_close,
+        },
+        "latest_bullish_fvg": latest_bullish_fvg,
+        "latest_bearish_fvg": latest_bearish_fvg,
+        "bullish_above": bullish_above,
+        "bearish_below": bearish_below,
     }
 
 
@@ -989,6 +1058,7 @@ class IndicatorBot:
                 "swings",
                 "swings_mini",
                 "fvgs",
+                "fvgs_lite",
                 "liquidity",
                 "volume_profile",
                 "trend",
@@ -1320,6 +1390,8 @@ class IndicatorBot:
                 snapshot["swings_mini"] = swings_mini
                 structural = snapshot["structural"]
                 fvgs = snapshot["fvgs"]
+                fvgs_lite = build_fvgs_lite(fvgs, last_candle)
+                snapshot["fvgs_lite"] = fvgs_lite
                 liquidity = snapshot["liquidity"]
                 volume_profile = snapshot["volume_profile"]
                 extras = snapshot["extras"]
@@ -1453,6 +1525,7 @@ class IndicatorBot:
                     "swings",
                     "swings_mini",
                     "fvgs",
+                    "fvgs_lite",
                     "liquidity",
                     "volume_profile",
                     "trend",
