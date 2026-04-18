@@ -30,6 +30,14 @@ from strategy_bos_fvg_ltf import (
     export_bridge_snapshot_for_symbol as export_bos_fvg_ltf_snapshot_for_symbol,
     restore_bridge_snapshot_for_symbol as restore_bos_fvg_ltf_snapshot_for_symbol,
 )
+from strategy_bos_fvg_ltf_tp1 import (
+    get_live_bridge_rows as get_bos_fvg_ltf_tp1_live_bridge_rows,
+    apply_live_bridge_db_state as apply_bos_fvg_ltf_tp1_live_bridge_db_state,
+    set_bridge_runtime_mode as set_bos_fvg_ltf_tp1_runtime_mode,
+    get_bridge_runtime_mode as get_bos_fvg_ltf_tp1_runtime_mode,
+    export_bridge_snapshot_for_symbol as export_bos_fvg_ltf_tp1_snapshot_for_symbol,
+    restore_bridge_snapshot_for_symbol as restore_bos_fvg_ltf_tp1_snapshot_for_symbol,
+)
 import spot_event as spot_event_module
 
 
@@ -491,7 +499,30 @@ def _sanitize_bridge_active_trades_payload(payload: Dict[str, Any]) -> Dict[str,
 
 
 async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> None:
-    rows = get_bos_fvg_ltf_live_bridge_rows()
+    await _sync_bridge_rows_to_supabase(
+        client=client,
+        rows=get_bos_fvg_ltf_live_bridge_rows(),
+        apply_db_state=apply_bos_fvg_ltf_live_bridge_db_state,
+        manage_c_apply_module="strategy_bos_fvg_ltf",
+        bridge_log_label="BOS_FVG_BRIDGE",
+    )
+    await _sync_bridge_rows_to_supabase(
+        client=client,
+        rows=get_bos_fvg_ltf_tp1_live_bridge_rows(),
+        apply_db_state=apply_bos_fvg_ltf_tp1_live_bridge_db_state,
+        manage_c_apply_module="strategy_bos_fvg_ltf_tp1",
+        bridge_log_label="BOS_FVG_BRIDGE_TP1",
+    )
+
+
+async def _sync_bridge_rows_to_supabase(
+    *,
+    client: httpx.AsyncClient,
+    rows: list[Dict[str, Any]],
+    apply_db_state,
+    manage_c_apply_module: str,
+    bridge_log_label: str,
+) -> None:
     if not rows:
         return
     base_url, key = _sb_env()
@@ -499,18 +530,19 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
     for row in rows:
         tags = row.get("tags") if isinstance(row.get("tags"), list) else []
         setup_id = _tag_value(tags, "id") or str(row.get("setup_id") or "").strip()
+        strategy_id = _tag_value(tags, "strategy") or str(row.get("strategy") or "").strip()
         leg = _tag_value(tags, "leg") or str(row.get("leg") or "").strip()
         trade = _tag_value(tags, "trade") or str(row.get("trade") or "").strip()
-        if not setup_id or leg is None or trade is None:
+        if not setup_id or not strategy_id or leg is None or trade is None:
             continue
-        row_id = f"{setup_id}:{leg}:{trade}"
+        row_id = f"{strategy_id}:{setup_id}:{leg}:{trade}"
         active_params = {
             "select": "id,tags,status,manage",
-            "tags": f"cs.{{\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
+            "tags": f"cs.{{\"strategy:{strategy_id}\",\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
         }
         new_params = {
             "select": "id,tags",
-            "tags": f"cs.{{\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
+            "tags": f"cs.{{\"strategy:{strategy_id}\",\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
         }
         new_payload = _sanitize_bridge_new_trades_payload(row)
         db_new_insert_confirmed = False
@@ -523,7 +555,7 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
         except httpx.HTTPStatusError as e:
             active_rows = []
             body = (e.response.text if e.response is not None else str(e))[:240]
-            print(f"[BOS_FVG_BRIDGE][WARN] table=active_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
+            print(f"[{bridge_log_label}][WARN] table=active_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
         if active_rows:
             db_active_seen = True
             db_active_status = "nt-managing" if any(str(r.get("status") or "") == "nt-managing" for r in active_rows) else "nt-waiting"
@@ -544,23 +576,23 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
             except httpx.HTTPStatusError as e:
                 existing_new_rows = []
                 body = (e.response.text if e.response is not None else str(e))[:240]
-                print(f"[BOS_FVG_BRIDGE][WARN] table=new_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
+                print(f"[{bridge_log_label}][WARN] table=new_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
             if existing_new_rows:
                 db_new_insert_confirmed = True
                 _BRIDGE_NEW_INSERTED_KEYS.add(row_id)
             else:
                 try:
                     print(
-                        f"[BOS_FVG_BRIDGE][DB_WRITE] action=insert table=new_trades "
+                        f"[{bridge_log_label}][DB_WRITE] action=insert table=new_trades "
                         f"id={setup_id} leg={leg} trade={trade} payload={json.dumps(new_payload, default=str, sort_keys=True)}"
                     )
                     await _sb_insert(client, base_url, key, "new_trades", payload=new_payload, returning="minimal")
                     _BRIDGE_NEW_INSERTED_KEYS.add(row_id)
                     db_new_insert_confirmed = True
-                    print(f"[BOS_FVG_BRIDGE][DB_APPLIED] action=insert table=new_trades id={setup_id} leg={leg} trade={trade}")
+                    print(f"[{bridge_log_label}][DB_APPLIED] action=insert table=new_trades id={setup_id} leg={leg} trade={trade}")
                 except httpx.HTTPStatusError as e:
                     body = (e.response.text if e.response is not None else str(e))[:240]
-                    print(f"[BOS_FVG_BRIDGE][WARN] table=new_trades id={setup_id} leg={leg} trade={trade} err={body}")
+                    print(f"[{bridge_log_label}][WARN] table=new_trades id={setup_id} leg={leg} trade={trade} err={body}")
 
         should_patch_active = False
         active_patch_payload: Dict[str, Any] = {}
@@ -586,7 +618,7 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
             # Only send sl_level if it actually changed
             current_sl = row.get("sl_level")
 
-            patch_key = f"{setup_id}:{leg}:{trade}"
+            patch_key = f"{strategy_id}:{setup_id}:{leg}:{trade}"
             last_payload = _BRIDGE_ACTIVE_PATCH_LAST.get(patch_key, {})
             last_sl = last_payload.get("sl_level")
 
@@ -596,7 +628,7 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
             active_patch_payload = _sanitize_bridge_active_trades_payload(active_patch_payload)
             should_patch_active = bool(active_patch_payload)
 
-        patch_key = f"{setup_id}:{leg}:{trade}"
+        patch_key = f"{strategy_id}:{setup_id}:{leg}:{trade}"
         if should_patch_active:
             last_payload = _BRIDGE_ACTIVE_PATCH_LAST.get(patch_key)
             if last_payload == active_patch_payload:
@@ -605,7 +637,7 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
         if should_patch_active:
             try:
                 print(
-                    f"[BOS_FVG_BRIDGE][DB_WRITE] action=patch table=active_trades "
+                    f"[{bridge_log_label}][DB_WRITE] action=patch table=active_trades "
                     f"id={setup_id} leg={leg} trade={trade} payload={json.dumps(active_patch_payload, default=str, sort_keys=True)}"
                 )
                 await _sb_patch(
@@ -618,16 +650,17 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
                     returning="minimal",
                 )
                 _BRIDGE_ACTIVE_PATCH_LAST[patch_key] = dict(active_patch_payload)
-                print(f"[BOS_FVG_BRIDGE][DB_APPLIED] action=patch table=active_trades id={setup_id} leg={leg} trade={trade}")
+                print(f"[{bridge_log_label}][DB_APPLIED] action=patch table=active_trades id={setup_id} leg={leg} trade={trade}")
                 if active_patch_payload.get("manage") == "C":
                     try:
-                        from strategy_bos_fvg_ltf import apply_live_bridge_manage_c_db_applied
+                        bridge_module = __import__(manage_c_apply_module, fromlist=["apply_live_bridge_manage_c_db_applied"])
+                        apply_live_bridge_manage_c_db_applied = getattr(bridge_module, "apply_live_bridge_manage_c_db_applied")
                         apply_live_bridge_manage_c_db_applied(setup_id, leg, trade)
                     except Exception:
                         pass
             except httpx.HTTPStatusError as e:
                 body = (e.response.text if e.response is not None else str(e))[:240]
-                print(f"[BOS_FVG_BRIDGE][WARN] table=active_trades id={setup_id} leg={leg} trade={trade} err={body}")
+                print(f"[{bridge_log_label}][WARN] table=active_trades id={setup_id} leg={leg} trade={trade} err={body}")
         db_state_updates.append(
             {
                 "setup_id": setup_id,
@@ -639,7 +672,7 @@ async def _sync_bos_fvg_bridge_rows_to_supabase(client: httpx.AsyncClient) -> No
                 "db_active_manage": db_active_manage,
             }
         )
-    apply_bos_fvg_ltf_live_bridge_db_state(db_state_updates)
+    apply_db_state(db_state_updates)
 
 
 async def _sb_upload_storage_file(
@@ -809,6 +842,7 @@ def _build_worker_snapshot(
             "sim_clock_ts": _to_iso_utc(getattr(engine, "sim_clock_ts", None)),
         },
         "bridge_state": export_bos_fvg_ltf_snapshot_for_symbol(sym),
+        "bridge_state_tp1": export_bos_fvg_ltf_tp1_snapshot_for_symbol(sym),
     }
 
 
@@ -874,6 +908,9 @@ def _restore_from_local_snapshot(
     bridge_state = payload.get("bridge_state")
     if isinstance(bridge_state, dict):
         restore_bos_fvg_ltf_snapshot_for_symbol(sym, bridge_state)
+    bridge_state_tp1 = payload.get("bridge_state_tp1")
+    if isinstance(bridge_state_tp1, dict):
+        restore_bos_fvg_ltf_tp1_snapshot_for_symbol(sym, bridge_state_tp1)
 
     restored = {
         "last_processed_ts": _parse_iso_dt(payload.get("last_processed_ts")),
@@ -884,6 +921,7 @@ def _restore_from_local_snapshot(
         "emitted_events": int(payload.get("emitted_events") or 0),
         "restored_run_id": str(payload.get("run_id") or ""),
         "runtime_mode": get_bos_fvg_ltf_runtime_mode(),
+        "runtime_mode_tp1": get_bos_fvg_ltf_tp1_runtime_mode(),
     }
     return restored
 
@@ -1488,12 +1526,15 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 emitted_events = int(restored_snapshot.get("emitted_events") or 0)
                 last_processed_ts = restored_snapshot.get("last_processed_ts") or last_processed_ts
                 runtime_mode = restored_snapshot.get("runtime_mode") if isinstance(restored_snapshot.get("runtime_mode"), dict) else {}
+                runtime_mode_tp1 = restored_snapshot.get("runtime_mode_tp1") if isinstance(restored_snapshot.get("runtime_mode_tp1"), dict) else {}
                 print(
                     f"[SIM_WORKER] snapshot_restore | Symbol={symbol} | "
                     f"snapshot_run_id={restored_snapshot.get('restored_run_id')} | "
                     f"resume_last_ts={_ts_str(last_processed_ts)} | "
                     f"execution_enabled={runtime_mode.get('execution_enabled')} | "
-                    f"live_mode={runtime_mode.get('live_mode')}"
+                    f"live_mode={runtime_mode.get('live_mode')} | "
+                    f"execution_enabled_tp1={runtime_mode_tp1.get('execution_enabled')} | "
+                    f"live_mode_tp1={runtime_mode_tp1.get('live_mode')}"
                 )
 
             # ------------------------------------------------------------
@@ -1505,9 +1546,17 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             catchup_batches = 0
             catchup_rows_total = 0
             restored_runtime = get_bos_fvg_ltf_runtime_mode() if restored_snapshot else {}
-            resume_direct_live = bool(restored_snapshot) and bool(restored_runtime.get("execution_enabled")) and bool(restored_runtime.get("live_mode"))
+            restored_runtime_tp1 = get_bos_fvg_ltf_tp1_runtime_mode() if restored_snapshot else {}
+            resume_direct_live = (
+                bool(restored_snapshot)
+                and bool(restored_runtime.get("execution_enabled"))
+                and bool(restored_runtime.get("live_mode"))
+                and bool(restored_runtime_tp1.get("execution_enabled"))
+                and bool(restored_runtime_tp1.get("live_mode"))
+            )
             if not resume_direct_live:
                 set_bos_fvg_ltf_runtime_mode(execution_enabled=False, live_mode=False)
+                set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=False, live_mode=False)
                 print(
                     f"[SIM_WORKER] catchup_start | Symbol={symbol} | "
                     f"seed_last_ts={_ts_str(last_processed_ts)} | mode=drain_until_empty"
@@ -1582,6 +1631,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - sync bridge rows to DB
             # ------------------------------------------------------------
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
+            set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=True, live_mode=True)
             live_start_anchor_ts = last_processed_ts
             print(
                 f"[SIM_WORKER] live_loop_start | Symbol={symbol} | "
@@ -1760,6 +1810,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
         logger.exception("simulation failed for symbol=%s: %s", symbol, msg)
         try:
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
+            set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=True, live_mode=True)
         except Exception:
             pass
         try:
