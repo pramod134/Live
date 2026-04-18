@@ -585,8 +585,8 @@ def build_fvgs_lite(
     bearish_below: List[Dict[str, Any]] = []
 
     if latest_close is not None:
-        bulls = []
-        bears = []
+        fvgs_above = []
+        fvgs_below = []
 
         for f in items:
             try:
@@ -598,16 +598,16 @@ def build_fvgs_lite(
             if f.get("filled") is True:
                 continue
 
-            if f.get("direction") == "bull" and low > latest_close:
-                bulls.append(f)
-            elif f.get("direction") == "bear" and high < latest_close:
-                bears.append(f)
+            if low > latest_close:
+                fvgs_above.append(f)
+            elif high < latest_close:
+                fvgs_below.append(f)
 
-        bulls.sort(key=lambda x: float(x.get("low")) - latest_close)
-        bears.sort(key=lambda x: latest_close - float(x.get("high")))
+        fvgs_above.sort(key=lambda x: float(x.get("low")) - latest_close)
+        fvgs_below.sort(key=lambda x: latest_close - float(x.get("high")))
 
-        bullish_above = bulls[:n_above]
-        bearish_below = bears[:n_below]
+        bullish_above = fvgs_above[:n_above]
+        bearish_below = fvgs_below[:n_below]
 
     return {
         "reference": {
