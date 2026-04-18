@@ -48,6 +48,7 @@ async def update_indicators_in_spot_tf(
     trend: Dict[str, Any],
     pivots: Dict[str, Any],
     swings: Dict[str, Any],
+    swings_mini: Dict[str, Any],
     structural: Dict[str, Any],
     fvgs: List[Dict[str, Any]],
     liquidity: Dict[str, Any],
@@ -92,6 +93,7 @@ async def update_indicators_in_spot_tf(
         "trend": trend,
         "pivots": pivots,
         "swings": swings,
+        "swings_mini": swings_mini,
         "structural": structural,
         "fvgs": fvgs,
         "liquidity": liquidity,
@@ -471,6 +473,74 @@ def _tf_to_timedelta(tf: str) -> Optional[dt.timedelta]:
             return None
 
     return None
+
+
+def build_swings_mini(
+    swings_obj: Dict[str, Any],
+    last_candle: Optional[Dict[str, Any]],
+    *,
+    n_above: int = 4,
+    n_below: int = 4,
+) -> Dict[str, Any]:
+    swings = list((swings_obj or {}).get("swings") or [])
+
+    latest_close = None
+    ref_ts = None
+    if isinstance(last_candle, dict):
+        ref_ts = last_candle.get("ts")
+        try:
+            if last_candle.get("close") is not None:
+                latest_close = float(last_candle.get("close"))
+        except Exception:
+            latest_close = None
+
+    latest_swing_high = None
+    latest_swing_low = None
+
+    for s in reversed(swings):
+        if latest_swing_high is None and s.get("type") == "swing_high":
+            latest_swing_high = s
+        if latest_swing_low is None and s.get("type") == "swing_low":
+            latest_swing_low = s
+        if latest_swing_high is not None and latest_swing_low is not None:
+            break
+
+    swing_highs_above: List[Dict[str, Any]] = []
+    swing_lows_below: List[Dict[str, Any]] = []
+
+    if latest_close is not None:
+        highs = []
+        lows = []
+
+        for s in swings:
+            try:
+                price = float(s.get("price"))
+            except Exception:
+                continue
+
+            if s.get("type") == "swing_high" and price > latest_close:
+                highs.append(s)
+            elif s.get("type") == "swing_low" and price < latest_close:
+                lows.append(s)
+
+        highs.sort(key=lambda x: float(x.get("price")) - latest_close)
+        lows.sort(key=lambda x: latest_close - float(x.get("price")))
+
+        swing_highs_above = highs[:n_above]
+        swing_lows_below = lows[:n_below]
+
+    return {
+        "asof": (swings_obj or {}).get("asof"),
+        "tf": (swings_obj or {}).get("tf"),
+        "reference": {
+            "ts": ref_ts,
+            "close": latest_close,
+        },
+        "latest_swing_high": latest_swing_high,
+        "latest_swing_low": latest_swing_low,
+        "swing_highs_above": swing_highs_above,
+        "swing_lows_below": swing_lows_below,
+    }
 
 
 
@@ -917,6 +987,7 @@ class IndicatorBot:
             for key in (
                 "structure_state",
                 "swings",
+                "swings_mini",
                 "fvgs",
                 "liquidity",
                 "volume_profile",
@@ -1245,6 +1316,8 @@ class IndicatorBot:
                 trend = snapshot["trend"]
                 pivots = snapshot["pivots"]
                 swings = snapshot["swings"]
+                swings_mini = build_swings_mini(swings, last_candle)
+                snapshot["swings_mini"] = swings_mini
                 structural = snapshot["structural"]
                 fvgs = snapshot["fvgs"]
                 liquidity = snapshot["liquidity"]
@@ -1378,6 +1451,7 @@ class IndicatorBot:
                 for key in (
                     "structure_state",
                     "swings",
+                    "swings_mini",
                     "fvgs",
                     "liquidity",
                     "volume_profile",
