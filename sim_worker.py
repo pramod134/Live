@@ -165,6 +165,28 @@ async def _fetch_new_rth_1m_rows(
     )
 
 
+async def _fetch_new_htf_rows(
+    engine: CandleEngine,
+    symbol: str,
+    timeframe: str,
+    after_ts: Optional[dt.datetime],
+    upto_ts: Optional[dt.datetime] = None,
+    limit: int = 5000,
+) -> list[Dict[str, Any]]:
+    ts_gte = None
+    if after_ts is not None:
+        ts_gte = _iso_utc(after_ts + dt.timedelta(microseconds=1))
+    ts_lte = _iso_utc(upto_ts) if upto_ts is not None else None
+    return await engine._sb_fetch_candles(
+        table=f"candle_history_{timeframe}",
+        symbol=symbol,
+        ts_gte=ts_gte,
+        ts_lte=ts_lte,
+        limit=limit,
+        order_asc=True,
+    )
+
+
 async def _process_rth_1m_rows(
     *,
     engine: CandleEngine,
@@ -187,6 +209,9 @@ async def _process_rth_1m_rows(
     engine.candles[sym].setdefault("1m", [])
     engine.latest_ts[sym].setdefault("1m", None)
     for tf in ("3m", "5m", "15m", "1h"):
+        engine.candles[sym].setdefault(tf, [])
+        engine.latest_ts[sym].setdefault(tf, None)
+    for tf in ("1d", "1w"):
         engine.candles[sym].setdefault(tf, [])
         engine.latest_ts[sym].setdefault(tf, None)
 
@@ -267,6 +292,25 @@ async def _process_rth_1m_rows(
                 await _sync_bos_fvg_bridge_rows_to_supabase(client)
             except Exception as bridge_err:
                 logger.warning("bridge sync failed during live loop: %s", bridge_err)
+
+    if last_processed_ts is not None:
+        for tf in ("1d", "1w"):
+            htf_rows = await _fetch_new_htf_rows(
+                engine=engine,
+                symbol=symbol,
+                timeframe=tf,
+                after_ts=engine.latest_ts[sym].get(tf),
+                upto_ts=last_processed_ts,
+                limit=5000,
+            )
+            for r in htf_rows:
+                raw_htf = _norm_db_row(r)
+                e_htf = engine._enrich_candle(sym, tf, raw_htf)
+                engine.candles[sym][tf].append(e_htf)
+                htf_ts_dt = _parse_iso_dt(e_htf.get("ts"))
+                engine.latest_ts[sym][tf] = htf_ts_dt
+                _record_event(tf, e_htf)
+                await bot.on_candle(symbol=symbol, timeframe=tf, candle=e_htf)
 
     return last_processed_ts, first_live_to_bot, last_live_to_bot, emitted_events
 
