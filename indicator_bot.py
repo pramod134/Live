@@ -640,8 +640,10 @@ def build_volume_profile_lite(
             hvns = profile.get("hvn_ranges") or []
             lvns = profile.get("lvn_ranges") or []
 
+            hvn_containing_price = []
             hvn_above = []
             hvn_below = []
+            lvn_containing_price = []
             lvn_above = []
             lvn_below = []
 
@@ -649,10 +651,14 @@ def build_volume_profile_lite(
                 if not isinstance(node, dict):
                     continue
                 try:
+                    node_low = float(node.get("low"))
+                    node_high = float(node.get("high"))
                     node_poc = float(node.get("poc"))
                 except Exception:
                     continue
-                if node_poc > latest_close:
+                if node_low <= latest_close <= node_high:
+                    hvn_containing_price.append(node)
+                elif node_poc > latest_close:
                     hvn_above.append(node)
                 elif node_poc < latest_close:
                     hvn_below.append(node)
@@ -661,24 +667,32 @@ def build_volume_profile_lite(
                 if not isinstance(node, dict):
                     continue
                 try:
+                    node_low = float(node.get("low"))
+                    node_high = float(node.get("high"))
                     node_poc = float(node.get("poc"))
                 except Exception:
                     continue
-                if node_poc > latest_close:
+                if node_low <= latest_close <= node_high:
+                    lvn_containing_price.append(node)
+                elif node_poc > latest_close:
                     lvn_above.append(node)
                 elif node_poc < latest_close:
                     lvn_below.append(node)
 
+            hvn_containing_price.sort(key=lambda x: abs(float(x.get("poc")) - latest_close))
             hvn_above.sort(key=lambda x: float(x.get("poc")) - latest_close)
             hvn_below.sort(key=lambda x: latest_close - float(x.get("poc")))
+            lvn_containing_price.sort(key=lambda x: abs(float(x.get("poc")) - latest_close))
             lvn_above.sort(key=lambda x: float(x.get("poc")) - latest_close)
             lvn_below.sort(key=lambda x: latest_close - float(x.get("poc")))
 
             out_profiles[profile_name] = {
                 "poc": profile.get("poc"),
                 "poc2": profile.get("poc2"),
+                "nearest_hvn_containing_price": hvn_containing_price[0] if hvn_containing_price else None,
                 "nearest_hvn_above": hvn_above[0] if hvn_above else None,
                 "nearest_hvn_below": hvn_below[0] if hvn_below else None,
+                "nearest_lvn_containing_price": lvn_containing_price[0] if lvn_containing_price else None,
                 "nearest_lvn_above": lvn_above[0] if lvn_above else None,
                 "nearest_lvn_below": lvn_below[0] if lvn_below else None,
             }
