@@ -42,9 +42,11 @@ async def update_indicators_in_spot_tf(
     swings: Dict[str, Any],
     swings_lite: Dict[str, Any],
     structural: Dict[str, Any],
+    structural_lite: Dict[str, Any],
     fvgs: List[Dict[str, Any]],
     fvgs_lite: Dict[str, Any],
     liquidity: Dict[str, Any],
+    liquidity_lite: Dict[str, Any],
     volume_profile: Dict[str, Any],
     volume_profile_lite: Dict[str, Any],
     extras: Dict[str, Any],
@@ -89,9 +91,11 @@ async def update_indicators_in_spot_tf(
         "swings": swings,
         "swings_lite": swings_lite,
         "structural": structural,
+        "structural_lite": structural_lite,
         "fvgs": fvgs,
         "fvgs_lite": fvgs_lite,
         "liquidity": liquidity,
+        "liquidity_lite": liquidity_lite,
         "volume_profile": volume_profile,
         "volume_profile_lite": volume_profile_lite,
         "extras": extras,
@@ -706,6 +710,140 @@ def build_volume_profile_lite(
     }
 
 
+def build_structural_lite(
+    structural: Dict[str, Any],
+    last_candle: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    latest_close = None
+    ref_ts = None
+    if isinstance(last_candle, dict):
+        ref_ts = last_candle.get("ts")
+        try:
+            if last_candle.get("close") is not None:
+                latest_close = float(last_candle.get("close"))
+        except Exception:
+            latest_close = None
+
+    points = list((structural or {}).get("points") or [])
+
+    latest_hh = None
+    latest_hl = None
+    latest_lh = None
+    latest_ll = None
+    nearest_high_above = None
+    nearest_low_below = None
+
+    if latest_close is not None:
+        highs_above = []
+        lows_below = []
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            label = p.get("label")
+            try:
+                price = float(p.get("price"))
+            except Exception:
+                continue
+
+            if label in ("HH", "LH") and price > latest_close:
+                highs_above.append(p)
+            elif label in ("HL", "LL") and price < latest_close:
+                lows_below.append(p)
+
+        highs_above.sort(key=lambda x: float(x.get("price")) - latest_close)
+        lows_below.sort(key=lambda x: latest_close - float(x.get("price")))
+        nearest_high_above = highs_above[0] if highs_above else None
+        nearest_low_below = lows_below[0] if lows_below else None
+
+    for p in reversed(points):
+        if not isinstance(p, dict):
+            continue
+        label = p.get("label")
+        if latest_hh is None and label == "HH":
+            latest_hh = p
+        if latest_hl is None and label == "HL":
+            latest_hl = p
+        if latest_lh is None and label == "LH":
+            latest_lh = p
+        if latest_ll is None and label == "LL":
+            latest_ll = p
+        if latest_hh is not None and latest_hl is not None and latest_lh is not None and latest_ll is not None:
+            break
+
+    return {
+        "asof": (structural or {}).get("asof"),
+        "reference": {
+            "ts": ref_ts,
+            "close": latest_close,
+        },
+        "latest_hh": latest_hh,
+        "latest_hl": latest_hl,
+        "latest_lh": latest_lh,
+        "latest_ll": latest_ll,
+        "nearest_high_above": nearest_high_above,
+        "nearest_low_below": nearest_low_below,
+    }
+
+
+def build_liquidity_lite(
+    liquidity: Dict[str, Any],
+    last_candle: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    latest_close = None
+    ref_ts = None
+    if isinstance(last_candle, dict):
+        ref_ts = last_candle.get("ts")
+        try:
+            if last_candle.get("close") is not None:
+                latest_close = float(last_candle.get("close"))
+        except Exception:
+            latest_close = None
+
+    levels = list((liquidity or {}).get("levels") or [])
+
+    intact_above = []
+    intact_below = []
+    swept_above = []
+    swept_below = []
+
+    if latest_close is not None:
+        for lv in levels:
+            if not isinstance(lv, dict):
+                continue
+            try:
+                price = float(lv.get("price"))
+            except Exception:
+                continue
+            state = str(lv.get("state") or "")
+            if price > latest_close:
+                if state == "intact":
+                    intact_above.append(lv)
+                else:
+                    swept_above.append(lv)
+            elif price < latest_close:
+                if state == "intact":
+                    intact_below.append(lv)
+                else:
+                    swept_below.append(lv)
+
+        intact_above.sort(key=lambda x: float(x.get("price")) - latest_close)
+        intact_below.sort(key=lambda x: latest_close - float(x.get("price")))
+        swept_above.sort(key=lambda x: float(x.get("price")) - latest_close)
+        swept_below.sort(key=lambda x: latest_close - float(x.get("price")))
+
+    return {
+        "asof": (liquidity or {}).get("asof"),
+        "reference": {
+            "ts": ref_ts,
+            "close": latest_close,
+        },
+        "nearest_intact_above": intact_above[0] if intact_above else None,
+        "nearest_intact_below": intact_below[0] if intact_below else None,
+        "nearest_swept_above": swept_above[0] if swept_above else None,
+        "nearest_swept_below": swept_below[0] if swept_below else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # VP enrichment (prop-desk style context ranker)
 # ---------------------------------------------------------------------------
@@ -1151,9 +1289,12 @@ class IndicatorBot:
                 "structure_state",
                 "swings",
                 "swings_lite",
+                "structural",
+                "structural_lite",
                 "fvgs",
                 "fvgs_lite",
                 "liquidity",
+                "liquidity_lite",
                 "volume_profile",
                 "volume_profile_lite",
                 "trend",
@@ -1162,7 +1303,6 @@ class IndicatorBot:
                 "strategies",
                 "extras_advanced",
                 "pivots",
-                "structural",
             ):
                 if key in snapshot:
                     payload[key] = snapshot.get(key)
@@ -1484,10 +1624,14 @@ class IndicatorBot:
                 swings_lite = build_swings_lite(swings, last_candle)
                 snapshot["swings_lite"] = swings_lite
                 structural = snapshot["structural"]
+                structural_lite = build_structural_lite(structural, last_candle)
+                snapshot["structural_lite"] = structural_lite
                 fvgs = snapshot["fvgs"]
                 fvgs_lite = build_fvgs_lite(fvgs, last_candle)
                 snapshot["fvgs_lite"] = fvgs_lite
                 liquidity = snapshot["liquidity"]
+                liquidity_lite = build_liquidity_lite(liquidity, last_candle)
+                snapshot["liquidity_lite"] = liquidity_lite
                 volume_profile = snapshot["volume_profile"]
                 volume_profile_lite = build_volume_profile_lite(volume_profile, last_candle)
                 snapshot["volume_profile_lite"] = volume_profile_lite
@@ -1621,9 +1765,12 @@ class IndicatorBot:
                     "structure_state",
                     "swings",
                     "swings_lite",
+                    "structural",
+                    "structural_lite",
                     "fvgs",
                     "fvgs_lite",
                     "liquidity",
+                    "liquidity_lite",
                     "volume_profile",
                     "volume_profile_lite",
                     "trend",
@@ -1632,7 +1779,6 @@ class IndicatorBot:
                     "strategies",
                     "extras_advanced",
                     "pivots",
-                    "structural",
                 ):
                     if key in snapshot:
                         tick_payload[key] = snapshot.get(key)
