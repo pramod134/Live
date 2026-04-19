@@ -14,8 +14,6 @@ from indicator_calc1 import compute_all_indicators
 
 from indicator_calc2 import compute_advanced_extras
 
-
-
 from strategies import evaluate_strategies
 
 from liquidity_pool_builder import build_liquidity_pool
@@ -25,17 +23,11 @@ from spot_event import SpotEventContext, compute_spot_events
 
 from fvg_pool import build_symbol_fvg_pool, upsert_symbol_fvg_pool
 
-
-
-
-
-
 # NOTE:
 # Do NOT override print() in the simulation indicator bot.
 # We rely on stdout logs for end-to-end validation.
 
 EASTERN = dt.timezone(dt.timedelta(hours=-5))  # not critical, mainly for consistency
-
 
 # ---------------------------------------------------------------------------
 # Supabase helper: update indicators columns in spot_tf
@@ -54,6 +46,7 @@ async def update_indicators_in_spot_tf(
     fvgs_lite: Dict[str, Any],
     liquidity: Dict[str, Any],
     volume_profile: Dict[str, Any],
+    volume_profile_lite: Dict[str, Any],
     extras: Dict[str, Any],
     extras_advanced: Optional[Dict[str, Any]],
     structure_state: Optional[str],
@@ -100,6 +93,7 @@ async def update_indicators_in_spot_tf(
         "fvgs_lite": fvgs_lite,
         "liquidity": liquidity,
         "volume_profile": volume_profile,
+        "volume_profile_lite": volume_profile_lite,
         "extras": extras,
         "extras_advanced": extras_advanced,
         "last_updated": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -621,6 +615,82 @@ def build_fvgs_lite(
     }
 
 
+def build_volume_profile_lite(
+    volume_profile: Dict[str, Any],
+    last_candle: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    latest_close = None
+    ref_ts = None
+    if isinstance(last_candle, dict):
+        ref_ts = last_candle.get("ts")
+        try:
+            if last_candle.get("close") is not None:
+                latest_close = float(last_candle.get("close"))
+        except Exception:
+            latest_close = None
+
+    out_profiles: Dict[str, Any] = {}
+
+    profiles = (volume_profile or {}).get("profiles") or {}
+    if isinstance(profiles, dict) and latest_close is not None:
+        for profile_name, profile in profiles.items():
+            if not isinstance(profile, dict):
+                continue
+
+            hvns = profile.get("hvn_ranges") or []
+            lvns = profile.get("lvn_ranges") or []
+
+            hvn_above = []
+            hvn_below = []
+            lvn_above = []
+            lvn_below = []
+
+            for node in hvns:
+                if not isinstance(node, dict):
+                    continue
+                try:
+                    node_poc = float(node.get("poc"))
+                except Exception:
+                    continue
+                if node_poc > latest_close:
+                    hvn_above.append(node)
+                elif node_poc < latest_close:
+                    hvn_below.append(node)
+
+            for node in lvns:
+                if not isinstance(node, dict):
+                    continue
+                try:
+                    node_poc = float(node.get("poc"))
+                except Exception:
+                    continue
+                if node_poc > latest_close:
+                    lvn_above.append(node)
+                elif node_poc < latest_close:
+                    lvn_below.append(node)
+
+            hvn_above.sort(key=lambda x: float(x.get("poc")) - latest_close)
+            hvn_below.sort(key=lambda x: latest_close - float(x.get("poc")))
+            lvn_above.sort(key=lambda x: float(x.get("poc")) - latest_close)
+            lvn_below.sort(key=lambda x: latest_close - float(x.get("poc")))
+
+            out_profiles[profile_name] = {
+                "poc": profile.get("poc"),
+                "poc2": profile.get("poc2"),
+                "nearest_hvn_above": hvn_above[0] if hvn_above else None,
+                "nearest_hvn_below": hvn_below[0] if hvn_below else None,
+                "nearest_lvn_above": lvn_above[0] if lvn_above else None,
+                "nearest_lvn_below": lvn_below[0] if lvn_below else None,
+            }
+
+    return {
+        "reference": {
+            "ts": ref_ts,
+            "close": latest_close,
+        },
+        "profiles": out_profiles,
+    }
+
 
 # ---------------------------------------------------------------------------
 # VP enrichment (prop-desk style context ranker)
@@ -1071,6 +1141,7 @@ class IndicatorBot:
                 "fvgs_lite",
                 "liquidity",
                 "volume_profile",
+                "volume_profile_lite",
                 "trend",
                 "extras",
                 "last_candle",
@@ -1404,6 +1475,8 @@ class IndicatorBot:
                 snapshot["fvgs_lite"] = fvgs_lite
                 liquidity = snapshot["liquidity"]
                 volume_profile = snapshot["volume_profile"]
+                volume_profile_lite = build_volume_profile_lite(volume_profile, last_candle)
+                snapshot["volume_profile_lite"] = volume_profile_lite
                 extras = snapshot["extras"]
                 structure_state = snapshot["structure_state"]
                 extras_advanced = pack["extras_advanced"]
@@ -1538,6 +1611,7 @@ class IndicatorBot:
                     "fvgs_lite",
                     "liquidity",
                     "volume_profile",
+                    "volume_profile_lite",
                     "trend",
                     "extras",
                     "last_candle",
