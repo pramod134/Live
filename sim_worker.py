@@ -1257,18 +1257,27 @@ async def _fetch_live_ticker_strategy_config(
     client: httpx.AsyncClient,
     *,
     symbol_db: str,
+    live_ticker_id: Optional[Any] = None,
+    run_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     base_url, key = _sb_env()
+    params: Dict[str, str] = {
+        "select": "run_strategy,selected_strategy",
+        "limit": "1",
+    }
+    if live_ticker_id is not None and str(live_ticker_id).strip() != "":
+        params["id"] = f"eq.{live_ticker_id}"
+    elif run_id and str(run_id).strip():
+        params["run_id"] = f"eq.{run_id}"
+        params["symbol"] = f"eq.{symbol_db}"
+    else:
+        params["symbol"] = f"eq.{symbol_db}"
     row = await _sb_select_one(
         client,
         base_url,
         key,
         "live_ticker",
-        params={
-            "select": "run_strategy,selected_strategy",
-            "symbol": f"eq.{symbol_db}",
-            "limit": "1",
-        },
+        params=params,
     )
     if not row:
         return None
@@ -1326,6 +1335,24 @@ def _apply_runtime_strategy_config(bot: IndicatorBot, symbol: str, config: Optio
     )
 
 
+def _live_ticker_row_key(row: Dict[str, Any]) -> str:
+    row_id = row.get("id")
+    if row_id is not None and str(row_id).strip() != "":
+        return f"id:{row_id}"
+    symbol_db = str(row.get("_symbol_db") or row.get("symbol") or "").strip()
+    return f"symbol:{symbol_db}"
+
+
+def _live_ticker_row_params(row: Dict[str, Any], *, run_id: Optional[str] = None) -> Dict[str, str]:
+    row_id = row.get("id")
+    if row_id is not None and str(row_id).strip() != "":
+        return {"id": f"eq.{row_id}"}
+    symbol_db = str(row.get("_symbol_db") or row.get("symbol") or "").strip()
+    if run_id and str(run_id).strip():
+        return {"symbol": f"eq.{symbol_db}", "run_id": f"eq.{run_id}"}
+    return {"symbol": f"eq.{symbol_db}"}
+
+
 async def _start_job_row(client: httpx.AsyncClient, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Mark a live_ticker row as running and assign a fresh run_id,
@@ -1342,7 +1369,7 @@ async def _start_job_row(client: httpx.AsyncClient, row: Dict[str, Any]) -> Opti
         base_url,
         key,
         "live_ticker",
-        params={"symbol": f"eq.{symbol_db}"},
+        params=_live_ticker_row_params(row),
         payload={
             "status": "running",
             "run_id": run_id,
@@ -1422,23 +1449,25 @@ def _parallel_workers_from_env(job_count: int) -> int:
     return max(1, value)
 
 
-async def _mark_done(client: httpx.AsyncClient, symbol: str) -> None:
+async def _mark_done(client: httpx.AsyncClient, row: Dict[str, Any]) -> None:
     base_url, key = _sb_env()
     now = dt.datetime.now(dt.timezone.utc).isoformat()
+    run_id = str(row.get("run_id") or "").strip() or None
     await _sb_patch(
         client,
         base_url,
         key,
         "live_ticker",
-        params={"symbol": f"eq.{symbol}"},
+        params=_live_ticker_row_params(row, run_id=run_id),
         payload={"status": "done", "finished_at": now},
         returning="minimal",
     )
 
 
-async def _mark_stopped(client: httpx.AsyncClient, symbol: str, note: Optional[str] = None) -> None:
+async def _mark_stopped(client: httpx.AsyncClient, row: Dict[str, Any], note: Optional[str] = None) -> None:
     base_url, key = _sb_env()
     now = dt.datetime.now(dt.timezone.utc).isoformat()
+    run_id = str(row.get("run_id") or "").strip() or None
     payload: Dict[str, Any] = {
         "status": "stopped",
         "finished_at": now,
@@ -1450,21 +1479,22 @@ async def _mark_stopped(client: httpx.AsyncClient, symbol: str, note: Optional[s
         base_url,
         key,
         "live_ticker",
-        params={"symbol": f"eq.{symbol}"},
+        params=_live_ticker_row_params(row, run_id=run_id),
         payload=payload,
         returning="minimal",
     )
 
 
-async def _mark_error(client: httpx.AsyncClient, symbol: str, msg: str) -> None:
+async def _mark_error(client: httpx.AsyncClient, row: Dict[str, Any], msg: str) -> None:
     base_url, key = _sb_env()
     now = dt.datetime.now(dt.timezone.utc).isoformat()
+    run_id = str(row.get("run_id") or "").strip() or None
     await _sb_patch(
         client,
         base_url,
         key,
         "live_ticker",
-        params={"symbol": f"eq.{symbol}"},
+        params=_live_ticker_row_params(row, run_id=run_id),
         payload={"status": "error", "error_message": msg[:2000], "finished_at": now},
         returning="minimal",
     )
@@ -1486,7 +1516,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
     if not symbol or not seed_date or sim_period <= 0:
         msg = f"Invalid job fields: symbol={symbol!r} seed_date={seed_date!r} sim_period={sim_period!r}"
         logger.error(msg)
-        await _mark_error(client, symbol_db or "UNKNOWN", msg)
+        await _mark_error(client, job, msg)
         return 1
 
     logger.info(
@@ -1690,6 +1720,8 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 latest_strategy_cfg = await _fetch_live_ticker_strategy_config(
                     client,
                     symbol_db=symbol_db,
+                    live_ticker_id=job.get("id"),
+                    run_id=run_id,
                 )
                 _apply_runtime_strategy_config(bot, symbol, latest_strategy_cfg)
 
@@ -1834,7 +1866,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                     "error_message": None,
                 },
             )
-            await _mark_done(client, symbol_db)
+            await _mark_done(client, job)
             _delete_local_snapshot(symbol)
             base_url, key = _sb_env()
             await _sb_upload_storage_file(
@@ -1881,7 +1913,7 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
         except Exception as e3:
             logger.warning("failed to update live_runs error payload run_id=%s: %s", run_id, e3)
         try:
-            await _mark_error(client, symbol_db or symbol, msg)
+            await _mark_error(client, job, msg)
         except Exception as e2:
             logger.exception("failed to mark DB error for symbol=%s: %s", symbol, e2)
         return 1
@@ -1973,42 +2005,45 @@ async def main() -> int:
                 await asyncio.sleep(poll_s)
                 continue
 
-            rows_by_symbol: Dict[str, Dict[str, Any]] = {
-                str(r.get("_symbol_db") or r.get("symbol") or ""): r
+            rows_by_key: Dict[str, Dict[str, Any]] = {
+                _live_ticker_row_key(r): r
                 for r in rows
                 if str(r.get("_symbol_db") or r.get("symbol") or "")
             }
 
             # Start rows that want to run and do not already have a child.
-            for symbol_db, row in rows_by_symbol.items():
+            for row_key, row in rows_by_key.items():
+                symbol_db = str(row.get("_symbol_db") or row.get("symbol") or "")
                 desired_on = str(row.get("start_sim") or "").strip().lower() == "y"
-                child_info = running_children.get(symbol_db)
+                child_info = running_children.get(row_key)
                 if desired_on and child_info is None:
                     try:
                         started = await _start_job_row(client, row)
                         if not started:
                             continue
                         proc = await _spawn_job_subprocess(started)
-                        running_children[symbol_db] = {
+                        running_children[row_key] = {
                             "proc": proc,
                             "run_id": started.get("run_id"),
+                            "job": started,
                         }
                         logger.info(
-                            "spawned child for symbol=%s run_id=%s pid=%s",
+                            "spawned child for row=%s symbol=%s run_id=%s pid=%s",
+                            row_key,
                             symbol_db,
                             started.get("run_id"),
                             getattr(proc, "pid", None),
                         )
                     except Exception as e:
-                        logger.exception("failed to spawn child for symbol=%s: %s", symbol_db, e)
+                        logger.exception("failed to spawn child for row=%s symbol=%s: %s", row_key, symbol_db, e)
                         try:
-                            await _mark_error(client, symbol_db, f"spawn failed: {type(e).__name__}: {e}")
+                            await _mark_error(client, row, f"spawn failed: {type(e).__name__}: {e}")
                         except Exception:
                             pass
 
             # Stop children whose rows no longer want to run, or whose row disappeared.
-            for symbol_db, info in list(running_children.items()):
-                row = rows_by_symbol.get(symbol_db)
+            for row_key, info in list(running_children.items()):
+                row = rows_by_key.get(row_key)
                 desired_on = bool(row) and str(row.get("start_sim") or "").strip().lower() == "y"
                 if not desired_on:
                     proc = info.get("proc")
@@ -2016,16 +2051,18 @@ async def main() -> int:
                         try:
                             await _stop_child_process(proc)
                         except Exception as e:
-                            logger.warning("failed to stop child for symbol=%s: %s", symbol_db, e)
+                            logger.warning("failed to stop child for row=%s: %s", row_key, e)
                     try:
-                        await _mark_stopped(client, symbol_db, note="start_sim turned off")
+                        row_for_stop = row or dict(info.get("job") or {})
+                        if row_for_stop:
+                            await _mark_stopped(client, row_for_stop, note="start_sim turned off")
                     except Exception as e:
-                        logger.warning("failed to mark stopped for symbol=%s: %s", symbol_db, e)
-                    running_children.pop(symbol_db, None)
-                    logger.info("stopped child for symbol=%s because start_sim is not 'y'", symbol_db)
+                        logger.warning("failed to mark stopped for row=%s: %s", row_key, e)
+                    running_children.pop(row_key, None)
+                    logger.info("stopped child for row=%s because start_sim is not 'y'", row_key)
 
             # Respawn children that died unexpectedly while the row still wants to run.
-            for symbol_db, info in list(running_children.items()):
+            for row_key, info in list(running_children.items()):
                 proc = info.get("proc")
                 if proc is None:
                     continue
@@ -2033,10 +2070,10 @@ async def main() -> int:
                 if rc is None:
                     continue
 
-                row = rows_by_symbol.get(symbol_db)
+                row = rows_by_key.get(row_key)
                 desired_on = bool(row) and str(row.get("start_sim") or "").strip().lower() == "y"
-                logger.info("child exited for symbol=%s rc=%s desired_on=%s", symbol_db, rc, desired_on)
-                running_children.pop(symbol_db, None)
+                logger.info("child exited for row=%s rc=%s desired_on=%s", row_key, rc, desired_on)
+                running_children.pop(row_key, None)
 
                 if desired_on and row is not None:
                     try:
@@ -2044,20 +2081,23 @@ async def main() -> int:
                         if not started:
                             continue
                         proc2 = await _spawn_job_subprocess(started)
-                        running_children[symbol_db] = {
+                        running_children[row_key] = {
                             "proc": proc2,
                             "run_id": started.get("run_id"),
+                            "job": started,
                         }
+                        symbol_db = str(row.get("_symbol_db") or row.get("symbol") or "")
                         logger.info(
-                            "respawned child for symbol=%s run_id=%s pid=%s",
+                            "respawned child for row=%s symbol=%s run_id=%s pid=%s",
+                            row_key,
                             symbol_db,
                             started.get("run_id"),
                             getattr(proc2, "pid", None),
                         )
                     except Exception as e:
-                        logger.exception("failed to respawn child for symbol=%s: %s", symbol_db, e)
+                        logger.exception("failed to respawn child for row=%s: %s", row_key, e)
                         try:
-                            await _mark_error(client, symbol_db, f"respawn failed: {type(e).__name__}: {e}")
+                            await _mark_error(client, row, f"respawn failed: {type(e).__name__}: {e}")
                         except Exception:
                             pass
 
