@@ -221,6 +221,183 @@ def _compute_atr(candles: List[Dict[str, Any]], period: int = 14) -> Optional[fl
     return sum(trs) / len(trs)
 
 
+def _get_dynamic_weights(c: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Returns (gaussian_weight, body_weight).
+
+    Design goals:
+    - Keep behavior close to 70/30 baseline
+    - Increase body weight for strong directional candles
+    - Increase gaussian weight for indecision / high-wick candles
+    - Capture wick asymmetry (rejection behavior)
+    """
+    high = float(c["high"])
+    low = float(c["low"])
+    open_p = float(c["open"])
+    close_p = float(c["close"])
+
+    total_range = high - low
+    if total_range <= 0:
+        return 0.70, 0.30
+
+    body = abs(close_p - open_p)
+    upper_wick = high - max(open_p, close_p)
+    lower_wick = min(open_p, close_p) - low
+
+    body_ratio = body / total_range
+    wick_ratio = (upper_wick + lower_wick) / total_range
+    wick_imbalance = abs(upper_wick - lower_wick) / total_range
+
+    body_component = 0.25 * body_ratio
+    wick_component = 0.20 * wick_ratio
+    rejection_component = 0.10 * wick_imbalance
+
+    body_weight = 0.30 + body_component - wick_component - rejection_component
+    body_weight = max(0.20, min(0.55, body_weight))
+    gaussian_weight = 1.0 - body_weight
+
+    return gaussian_weight, body_weight
+
+
+def _calculate_value_area_from_bins(
+    bins: List[Dict[str, Any]],
+    *,
+    value_area_pct: float = 0.70,
+    poc_prices: Optional[List[float]] = None,
+) -> Dict[str, Any]:
+    """
+    Calculate Value Area from VP bins using outward expansion from a chosen POC.
+    """
+    if not bins:
+        return {
+            "vah": None,
+            "val": None,
+            "va_poc": None,
+            "value_area_pct": float(value_area_pct),
+            "value_area_volume": 0.0,
+            "total_volume": 0.0,
+            "covered_volume": 0.0,
+            "covered_pct": 0.0,
+            "va_bin_count": 0,
+            "va_candidates": [],
+        }
+
+    bins_sorted = sorted(bins, key=lambda x: float(x.get("price", 0.0)))
+    prices = [float(b.get("price", 0.0)) for b in bins_sorted]
+    vols = [float(b.get("volume", 0.0)) for b in bins_sorted]
+
+    total_volume = float(sum(vols))
+    if total_volume <= 0.0:
+        p = prices[0] if prices else None
+        return {
+            "vah": p,
+            "val": p,
+            "va_poc": p,
+            "value_area_pct": float(value_area_pct),
+            "value_area_volume": 0.0,
+            "total_volume": 0.0,
+            "covered_volume": 0.0,
+            "covered_pct": 0.0,
+            "va_bin_count": 1 if p is not None else 0,
+            "va_candidates": [],
+        }
+
+    target_volume = total_volume * float(value_area_pct)
+
+    if not poc_prices:
+        max_idx = max(range(len(vols)), key=lambda i: vols[i])
+        poc_prices = [prices[max_idx]]
+
+    dedup_pocs: List[float] = []
+    for p in poc_prices:
+        try:
+            fp = float(p)
+        except Exception:
+            continue
+        if fp not in dedup_pocs:
+            dedup_pocs.append(fp)
+
+    def _nearest_idx_to_price(p: float) -> int:
+        return min(range(len(prices)), key=lambda i: abs(prices[i] - p))
+
+    def _expand_from_anchor(anchor_idx: int) -> Dict[str, Any]:
+        left = anchor_idx
+        right = anchor_idx
+        covered = float(vols[anchor_idx])
+
+        while covered < target_volume:
+            can_left = left - 1 >= 0
+            can_right = right + 1 < len(vols)
+
+            if not can_left and not can_right:
+                break
+
+            v_left = vols[left - 1] if can_left else -1.0
+            v_right = vols[right + 1] if can_right else -1.0
+
+            if can_left and can_right and v_left == v_right:
+                covered += v_left
+                left -= 1
+                if covered >= target_volume:
+                    break
+                covered += v_right
+                right += 1
+                continue
+
+            if v_right > v_left:
+                covered += v_right
+                right += 1
+            else:
+                covered += v_left
+                left -= 1
+
+        val = prices[left]
+        vah = prices[right]
+        width = vah - val
+        covered_pct = (covered / total_volume) if total_volume > 0 else 0.0
+
+        return {
+            "vah": float(vah),
+            "val": float(val),
+            "va_poc": float(prices[anchor_idx]),
+            "anchor_idx": int(anchor_idx),
+            "left_idx": int(left),
+            "right_idx": int(right),
+            "va_width": float(width),
+            "value_area_volume": float(target_volume),
+            "covered_volume": float(covered),
+            "covered_pct": float(covered_pct),
+            "va_bin_count": int(right - left + 1),
+        }
+
+    candidates: List[Dict[str, Any]] = []
+    for p in dedup_pocs:
+        anchor_idx = _nearest_idx_to_price(p)
+        candidates.append(_expand_from_anchor(anchor_idx))
+
+    candidates.sort(
+        key=lambda x: (
+            float(x["va_width"]),
+            -float(x["covered_volume"]),
+            abs(x["anchor_idx"]),
+        )
+    )
+    best = candidates[0]
+
+    return {
+        "vah": best["vah"],
+        "val": best["val"],
+        "va_poc": best["va_poc"],
+        "value_area_pct": float(value_area_pct),
+        "value_area_volume": float(best["value_area_volume"]),
+        "total_volume": float(total_volume),
+        "covered_volume": float(best["covered_volume"]),
+        "covered_pct": float(best["covered_pct"]),
+        "va_bin_count": int(best["va_bin_count"]),
+        "va_candidates": candidates,
+    }
+
+
 
 
 
@@ -283,11 +460,33 @@ def _compute_volume_profile(
 
     if p_max <= p_min:
         total_vol = sum(float(c.get("volume", 0.0)) for c in tail)
+        bins = [{"price": p_min, "volume": total_vol}]
+        value_area = _calculate_value_area_from_bins(
+            bins,
+            value_area_pct=0.70,
+            poc_prices=[p_min],
+        )
         return {
             "asof": candles[-1].get("ts"),
             "window": window,
             "poc": p_min,
-            "bins": [{"price": p_min, "volume": total_vol}],
+            "poc2": None,
+            "pocs": [p_min],
+            "poc_meta": {
+                "poc_algo": "dual_poc_v1",
+                "poc2_tol_ratio": 0.10,
+            },
+            "vah": value_area["vah"],
+            "val": value_area["val"],
+            "va_poc": value_area["va_poc"],
+            "va_meta": {
+                "value_area_pct": value_area["value_area_pct"],
+                "covered_volume": value_area["covered_volume"],
+                "covered_pct": value_area["covered_pct"],
+                "va_bin_count": value_area["va_bin_count"],
+                "va_candidates": value_area["va_candidates"],
+            },
+            "bins": bins,
             "start_ts": start_ts,
             "end_ts": end_ts,
             "bin_count": bins_count,
@@ -338,7 +537,8 @@ def _compute_volume_profile(
         # ---------------------------
         # Gaussian 70% (Hybrid B)
         # ---------------------------
-        vg = 0.70 * v
+        g_weight, b_weight = _get_dynamic_weights(c)
+        vg = g_weight * v
 
         vw = c.get("vw") or c.get("vwap")
         try:
@@ -386,7 +586,7 @@ def _compute_volume_profile(
         # ---------------------------
         # Body 30% (Hybrid B)
         # ---------------------------
-        vb = 0.30 * v
+        vb = b_weight * v
         body_lo = min(o, cl)
         body_hi = max(o, cl)
 
@@ -475,16 +675,33 @@ def _compute_volume_profile(
         bin_center = p_min + (i + 0.5) * width
         bins.append({"price": bin_center, "volume": float(vol)})
 
+    pocs = [p for p in [poc_price, poc2_price] if p is not None]
+    value_area = _calculate_value_area_from_bins(
+        bins,
+        value_area_pct=0.70,
+        poc_prices=pocs,
+    )
+
 
     return {
         "asof": candles[-1].get("ts"),
         "window": window,
         "poc": poc_price,           # POC1 (backward compatible)
         "poc2": poc2_price,         # POC2 (optional)
-        "pocs": [p for p in [poc_price, poc2_price] if p is not None],  # convenience list
+        "pocs": pocs,               # convenience list
         "poc_meta": {
             "poc_algo": "dual_poc_v1",
             "poc2_tol_ratio": 0.10,
+        },
+        "vah": value_area["vah"],
+        "val": value_area["val"],
+        "va_poc": value_area["va_poc"],
+        "va_meta": {
+            "value_area_pct": value_area["value_area_pct"],
+            "covered_volume": value_area["covered_volume"],
+            "covered_pct": value_area["covered_pct"],
+            "va_bin_count": value_area["va_bin_count"],
+            "va_candidates": value_area["va_candidates"],
         },
         "bins": bins,
         "start_ts": start_ts,
