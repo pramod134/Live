@@ -1704,6 +1704,8 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - allow first live candle to materialize pending setup
             # - sync bridge rows to DB
             # ------------------------------------------------------------
+            # Enable per-candle tick_tf writes only once we enter continuous live mode.
+            bot.set_tick_tf_writes_enabled(True)
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
             set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=True, live_mode=True)
             live_start_anchor_ts = last_processed_ts
