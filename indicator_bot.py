@@ -1066,13 +1066,16 @@ class IndicatorBot:
         self,
         engine: CandleEngine,
         timeframes: Optional[List[str]] = None,
-        # NOTE: sim_worker passes sim_mode=True. We accept it for compatibility
-        # but this simulation IndicatorBot performs NO DB writes regardless.
         sim_mode: bool = True,
+        tick_tf_writes_enabled: Optional[bool] = None,
     ):
         self.engine = engine
         self.timeframes = timeframes or list(SUPPORTED_TFS)
         self.sim_mode = bool(sim_mode)
+        if tick_tf_writes_enabled is None:
+            self.tick_tf_writes_enabled = not self.sim_mode
+        else:
+            self.tick_tf_writes_enabled = bool(tick_tf_writes_enabled)
         # last_processed_ts[symbol][tf] -> datetime of last processed candle
         self.last_processed_ts: Dict[str, Dict[str, dt.datetime]] = {}
         # last_snapshots[symbol][tf] -> most recent snapshot dict (for multi-TF VP context)
@@ -1127,9 +1130,13 @@ class IndicatorBot:
                 self._fixed_window_by_tf[tf] = max(0, int(raw))
             except Exception:
                 self._fixed_window_by_tf[tf] = self._fixed_window_default
+
     # ------------------------------------------------------------------ #
     # Simulation entrypoints (sim_worker depends on these)
     # ------------------------------------------------------------------ #
+
+    def set_tick_tf_writes_enabled(self, enabled: bool) -> None:
+        self.tick_tf_writes_enabled = bool(enabled)
 
     def set_strategy_runtime(self, symbol: str, run_strategy: Any, selected_strategy: Any) -> None:
         sym = (symbol or "").upper()
@@ -1783,7 +1790,7 @@ class IndicatorBot:
                     if key in snapshot:
                         tick_payload[key] = snapshot.get(key)
 
-                if tick_payload and not self.sim_mode:
+                if tick_payload and self.tick_tf_writes_enabled:
                     await update_tick_tf(symbol=sym_upper, timeframe=tf, payload=tick_payload)
     
                 # (log removed) was too noisy during simulation troubleshooting
