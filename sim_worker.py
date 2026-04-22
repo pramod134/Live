@@ -1704,6 +1704,11 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             # - allow first live candle to materialize pending setup
             # - sync bridge rows to DB
             # ------------------------------------------------------------
+            # IMPORTANT:
+            # IndicatorBot was initialized with sim_mode=True so catch-up does not
+            # continuously patch tick_tf. Once we enter live mode we must flip this
+            # flag so each newly closed candle updates tick_tf in real time.
+            bot.sim_mode = False
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
             set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=True, live_mode=True)
             live_start_anchor_ts = last_processed_ts
