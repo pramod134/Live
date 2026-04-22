@@ -602,7 +602,18 @@ async def _sync_bridge_rows_to_supabase(
             print(f"[{bridge_log_label}][WARN] table=active_trades action=select id={setup_id} leg={leg} trade={trade} err={body}")
         if active_rows:
             db_active_seen = True
-            db_active_status = "nt-managing" if any(str(r.get("status") or "") == "nt-managing" for r in active_rows) else "nt-waiting"
+            db_active_status = (
+                "nt-managing"
+                if any(
+                    (str(r.get("manage") or "") == "O")
+                    or (
+                        str(r.get("status") or "") == "nt-managing"
+                        and str(r.get("manage") or "") == "Y"
+                    )
+                    for r in active_rows
+                )
+                else "nt-waiting"
+            )
             for active_row in active_rows:
                 manage_val = active_row.get("manage")
                 if manage_val is not None:
