@@ -575,6 +575,7 @@ async def _sync_bridge_rows_to_supabase(
         tags = row.get("tags") if isinstance(row.get("tags"), list) else []
         setup_id = _tag_value(tags, "id") or str(row.get("setup_id") or "").strip()
         strategy_id = _tag_value(tags, "strategy") or str(row.get("strategy") or "").strip()
+        version = _tag_value(tags, "version") or str(row.get("version") or "").strip()
         leg = _tag_value(tags, "leg") or str(row.get("leg") or "").strip()
         trade = _tag_value(tags, "trade") or str(row.get("trade") or "").strip()
         if not setup_id or not strategy_id or leg is None or trade is None:
@@ -588,6 +589,10 @@ async def _sync_bridge_rows_to_supabase(
             "select": "id,tags",
             "tags": f"cs.{{\"strategy:{strategy_id}\",\"id:{setup_id}\",\"leg:{leg}\",\"trade:{trade}\"}}",
         }
+        setup_active_params = {
+            "select": "id,tags,status,manage",
+            "tags": f"cs.{{\"strategy:{strategy_id}\",\"version:{version}\",\"id:{setup_id}\"}}",
+        } if setup_id and strategy_id and version else None
         new_payload = _sanitize_bridge_new_trades_payload(row)
         db_new_insert_confirmed = False
         db_active_seen = False
@@ -595,7 +600,13 @@ async def _sync_bridge_rows_to_supabase(
         db_active_manage = None
 
         try:
-            active_rows = await _sb_select(client, base_url, key, "active_trades", params=active_params)
+            active_rows = await _sb_select(
+                client,
+                base_url,
+                key,
+                "active_trades",
+                params=(setup_active_params or active_params),
+            )
         except httpx.HTTPStatusError as e:
             active_rows = []
             body = (e.response.text if e.response is not None else str(e))[:240]
@@ -695,12 +706,16 @@ async def _sync_bridge_rows_to_supabase(
                     f"[{bridge_log_label}][DB_WRITE] action=patch table=active_trades "
                     f"id={setup_id} leg={leg} trade={trade} payload={json.dumps(active_patch_payload, default=str, sort_keys=True)}"
                 )
+                patch_params = active_params
+                if active_patch_payload.get("manage") == "C" and setup_active_params is not None:
+                    patch_params = setup_active_params
+
                 await _sb_patch(
                     client,
                     base_url,
                     key,
                     "active_trades",
-                    params=active_params,
+                    params=patch_params,
                     payload=active_patch_payload,
                     returning="minimal",
                 )
