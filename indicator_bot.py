@@ -1228,6 +1228,8 @@ class IndicatorBot:
             )
             advanced["post"] = post
             snapshot["structure_state_raw"] = raw_structure_state
+            advanced["structure_meta"] = post.get("structure_meta")
+            snapshot["structure_meta"] = post.get("structure_meta")
             if post.get("structure_state") is not None:
                 advanced["structure_state"] = post.get("structure_state")
                 snapshot["structure_state"] = post.get("structure_state")
@@ -1613,6 +1615,8 @@ class IndicatorBot:
                 )
                 advanced["post"] = post
                 snapshot["structure_state_raw"] = raw_structure_state
+                advanced["structure_meta"] = post.get("structure_meta")
+                snapshot["structure_meta"] = post.get("structure_meta")
                 if post.get("structure_state") is not None:
                     advanced["structure_state"] = post.get("structure_state")
                     snapshot["structure_state"] = post.get("structure_state")
