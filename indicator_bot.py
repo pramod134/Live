@@ -1474,7 +1474,37 @@ class IndicatorBot:
         except Exception as e:
             pass
             # print(f"[INDICATOR_BOT][DIAG] spot_event counters unavailable: {e}")
+        if self.sim_mode:
+            try:
+                asyncio.run(self._flush_sim_spot_events(sym))
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(self._flush_sim_spot_events(sym))
+                finally:
+                    loop.close()
         self._print_perf_summary_once(symbol)
+
+    async def _flush_sim_spot_events(self, symbol: str) -> None:
+        """
+        Write final simulated spot_events snapshots once at the end of simulation.
+        """
+        sym = (symbol or "").upper()
+        if not sym:
+            return
+
+        states_by_tf = self.last_events_state.get(sym, {}) or {}
+        for tf, state in states_by_tf.items():
+            if not isinstance(state, dict):
+                continue
+
+            await upsert_spot_events_row(
+                symbol=sym,
+                timeframe=tf,
+                events_latest=state.get("events_latest") or {},
+                events_active=state.get("events_active") or {},
+                events_recent=state.get("events_recent") or [],
+            )
 
 
 
