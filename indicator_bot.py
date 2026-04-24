@@ -1221,6 +1221,8 @@ class IndicatorBot:
             )
             self._calc2_calls_by_tf[tf] = self._calc2_calls_by_tf.get(tf, 0) + 1
 
+            snapshot["last_candle"] = last_candle
+
             raw_structure_state = snapshot.get("structure_state")
             post = compute_post_indicators(
                 base_snapshot=snapshot,
@@ -1237,7 +1239,6 @@ class IndicatorBot:
             # Attach extras_advanced to the cached snapshot so downstream consumers
             # see the same "row shape" we would have written to spot_tf.
             snapshot["extras_advanced"] = advanced
-            snapshot["last_candle"] = last_candle
 
             self.last_snapshots[sym][tf] = snapshot
             self.last_processed_ts[sym][tf] = ts_dt
@@ -1607,6 +1608,8 @@ class IndicatorBot:
                 )
                 self._record_perf("calc2", time.perf_counter() - t0, tf=tf)
                 self._calc2_calls_by_tf[tf] = self._calc2_calls_by_tf.get(tf, 0) + 1
+
+                snapshot["last_candle"] = last_candle
 
                 raw_structure_state = snapshot.get("structure_state")
                 post = compute_post_indicators(
