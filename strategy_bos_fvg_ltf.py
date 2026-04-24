@@ -719,6 +719,7 @@ def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
         f"setup_id={state.get('setup_id')}",
         f"side={state.get('side')}",
         f"bos={state.get('bos_info') is not None}",
+        f"bos_ts={(state.get('bos_info') or {}).get('bos_ts')}",
         f"fvg={state.get('fvg_info') is not None}",
         f"new_bos={state.get('new_bos_info') is not None}",
         f"latest_bull_fvg_ts={state.get('latest_bull_fvg_ts')}",
@@ -1322,6 +1323,31 @@ def evaluate_bos_fvg_ltf(
             }
             state["fvg_info"] = None
             _direct_state_log("phase1_bos_updated", state, bos_ts=candidate_bos.get("bos_ts"))
+
+    if state.get("phase") == "phase1_setup" and state.get("bos_info") and not state.get("fvg_info"):
+        bos_dt = _parse_ts((state.get("bos_info") or {}).get("bos_ts"))
+        fvg = _select_first_post_bos_fvg(fvg_source or [], state.get("side"), bos_dt)
+        if fvg:
+            fvg_score, trade_score, fvg_score_src, trade_score_src = _extract_fvg_score_fields(fvg)
+            state["fvg_info"] = {
+                "created_ts": fvg.get("created_ts"),
+                "direction": fvg.get("direction"),
+                "low": _safe_float(fvg.get("low")),
+                "high": _safe_float(fvg.get("high")),
+                "filled": bool(fvg.get("filled", False)),
+                "filled_ts": fvg.get("filled_ts"),
+                "fvg_score": fvg_score,
+                "trade_score": trade_score,
+                "fvg_score_src": fvg_score_src,
+                "trade_score_src": trade_score_src,
+            }
+            _direct_state_log(
+                "phase1_fvg_selected",
+                state,
+                fvg_ts=fvg.get("created_ts"),
+                fvg_low=_safe_float(fvg.get("low")),
+                fvg_high=_safe_float(fvg.get("high")),
+            )
 
     if state.get("phase") == "phase1_setup":
         if not state.get("bos_info") or not state.get("fvg_info"):
