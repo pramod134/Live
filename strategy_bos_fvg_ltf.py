@@ -721,6 +721,12 @@ def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
         f"bos={state.get('bos_info') is not None}",
         f"fvg={state.get('fvg_info') is not None}",
         f"new_bos={state.get('new_bos_info') is not None}",
+        f"latest_bull_fvg_ts={state.get('latest_bull_fvg_ts')}",
+        f"latest_bull_fvg_high={state.get('latest_bull_fvg_high')}",
+        f"latest_bull_fvg_low={state.get('latest_bull_fvg_low')}",
+        f"latest_bear_fvg_ts={state.get('latest_bear_fvg_ts')}",
+        f"latest_bear_fvg_high={state.get('latest_bear_fvg_high')}",
+        f"latest_bear_fvg_low={state.get('latest_bear_fvg_low')}",
     ]
     for k, v in extra.items():
         parts.append(f"{k}={_log_value(v)}")
@@ -982,6 +988,31 @@ def _select_first_post_bos_fvg(fvgs: List[Dict[str, Any]], setup_side: str, bos_
     return matches[0][1]
 
 
+def _latest_fvg_levels_for_log(fvgs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
+    for fvg in fvgs or []:
+        side = _normalize_fvg_direction(fvg.get("direction"))
+        if side not in {"bull", "bear"}:
+            continue
+        created_dt = _parse_ts(fvg.get("created_ts"))
+        if created_dt is None:
+            continue
+        prev = latest.get(side)
+        if prev is None or created_dt > prev[0]:
+            latest[side] = (created_dt, fvg)
+
+    bull = (latest.get("bull") or (None, {}))[1]
+    bear = (latest.get("bear") or (None, {}))[1]
+    return {
+        "latest_bull_fvg_ts": bull.get("created_ts"),
+        "latest_bull_fvg_high": _safe_float(bull.get("high")),
+        "latest_bull_fvg_low": _safe_float(bull.get("low")),
+        "latest_bear_fvg_ts": bear.get("created_ts"),
+        "latest_bear_fvg_high": _safe_float(bear.get("high")),
+        "latest_bear_fvg_low": _safe_float(bear.get("low")),
+    }
+
+
 def _match_selected_fvg(
     selected_fvg: Optional[Dict[str, Any]],
     fvg_source: List[Dict[str, Any]],
@@ -1119,10 +1150,16 @@ def evaluate_bos_fvg_ltf(
 
     if long_bos_detected and swing_high_key:
         state["broken_swing_highs"].add(swing_high_key)
-        print(f"[BOS-FVG-DB] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
+        print(
+            f"[BOS-FVG-DB] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price} | "
+            f"RefSwingTS={recent_high_ts} | BOSTS={last_ts}"
+        )
     if short_bos_detected and swing_low_key:
         state["broken_swing_lows"].add(swing_low_key)
-        print(f"[BOS-FVG-DB] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
+        print(
+            f"[BOS-FVG-DB] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price} | "
+            f"RefSwingTS={recent_low_ts} | BOSTS={last_ts}"
+        )
 
     chosen_side = "none"
     chosen_bos_detected = False
@@ -1215,6 +1252,7 @@ def evaluate_bos_fvg_ltf(
     state["mode"] = "live" if execution_enabled and live_mode else "sim"
 
     fvg_source = fvgs if isinstance(fvgs, list) else (last_candle.get("fvgs") if isinstance(last_candle.get("fvgs"), list) else [])
+    state.update(_latest_fvg_levels_for_log(fvg_source or []))
 
     # ------------------------------------------------------------
     # Direct DB lifecycle mode.
@@ -1264,6 +1302,26 @@ def evaluate_bos_fvg_ltf(
     if state["mode"] == "live" and state.get("phase") is None:
         state["phase"] = "phase1_setup"
         _direct_state_log("live_start", state)
+
+    if state.get("phase") == "phase1_setup" and candidate_bos is not None:
+        if (
+            not state.get("bos_info")
+            or state.get("setup_id") is None
+            or (state.get("bos_info") or {}).get("bos_ts") != candidate_bos.get("bos_ts")
+            or (state.get("bos_info") or {}).get("side") != candidate_bos.get("side")
+        ):
+            state["bos_info"] = deepcopy(candidate_bos)
+            state["side"] = candidate_bos.get("side")
+            state["swing_info"] = {
+                "entry_ref_swing_high": candidate_bos.get("entry_ref_swing_high"),
+                "entry_ref_swing_high_ts": candidate_bos.get("entry_ref_swing_high_ts"),
+                "entry_ref_swing_high_score": candidate_bos.get("entry_ref_swing_high_score"),
+                "entry_ref_swing_low": candidate_bos.get("entry_ref_swing_low"),
+                "entry_ref_swing_low_ts": candidate_bos.get("entry_ref_swing_low_ts"),
+                "entry_ref_swing_low_score": candidate_bos.get("entry_ref_swing_low_score"),
+            }
+            state["fvg_info"] = None
+            _direct_state_log("phase1_bos_updated", state, bos_ts=candidate_bos.get("bos_ts"))
 
     if state.get("phase") == "phase1_setup":
         if not state.get("bos_info") or not state.get("fvg_info"):
