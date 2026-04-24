@@ -14,6 +14,7 @@ from candle_engine import CandleEngine, SUPPORTED_TFS
 from indicator_calc1 import compute_all_indicators
 
 from indicator_calc2 import compute_advanced_extras
+from post_indicator import compute_post_indicators
 
 from strategies import evaluate_strategies
 
@@ -1220,6 +1221,17 @@ class IndicatorBot:
             )
             self._calc2_calls_by_tf[tf] = self._calc2_calls_by_tf.get(tf, 0) + 1
 
+            raw_structure_state = snapshot.get("structure_state")
+            post = compute_post_indicators(
+                base_snapshot=snapshot,
+                advanced_snapshot=advanced,
+            )
+            advanced["post"] = post
+            snapshot["structure_state_raw"] = raw_structure_state
+            if post.get("structure_state") is not None:
+                advanced["structure_state"] = post.get("structure_state")
+                snapshot["structure_state"] = post.get("structure_state")
+
             # Attach extras_advanced to the cached snapshot so downstream consumers
             # see the same "row shape" we would have written to spot_tf.
             snapshot["extras_advanced"] = advanced
@@ -1593,7 +1605,18 @@ class IndicatorBot:
                 )
                 self._record_perf("calc2", time.perf_counter() - t0, tf=tf)
                 self._calc2_calls_by_tf[tf] = self._calc2_calls_by_tf.get(tf, 0) + 1
-    
+
+                raw_structure_state = snapshot.get("structure_state")
+                post = compute_post_indicators(
+                    base_snapshot=snapshot,
+                    advanced_snapshot=advanced,
+                )
+                advanced["post"] = post
+                snapshot["structure_state_raw"] = raw_structure_state
+                if post.get("structure_state") is not None:
+                    advanced["structure_state"] = post.get("structure_state")
+                    snapshot["structure_state"] = post.get("structure_state")
+
                 pending[tf] = {
                     "closed_candles": closed_candles,
                     "session_candles": session_candles,

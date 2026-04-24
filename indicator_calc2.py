@@ -189,7 +189,33 @@ def _build_momentum_block(
         (base_snapshot.get("extras") or {}).get("atr")
     )
 
-    rsi_14 = _compute_rsi(closes, 14)
+    # --- RSI value + behavior ---
+    rsi_series: List[Optional[float]] = []
+    for i in range(len(closes)):
+        rsi_series.append(_compute_rsi(closes[: i + 1], 14))
+
+    rsi_14 = rsi_series[-1]
+    rsi_prev_3 = rsi_series[-4] if len(rsi_series) >= 4 else None
+
+    rsi_slope_3: Optional[float] = None
+    if rsi_14 is not None and rsi_prev_3 is not None:
+        rsi_slope_3 = rsi_14 - rsi_prev_3
+
+    rsi_regime: Optional[str] = None
+    if rsi_14 is not None:
+        if rsi_14 > 60:
+            rsi_regime = "bullish"
+        elif rsi_14 < 40:
+            rsi_regime = "bearish"
+        else:
+            rsi_regime = "neutral"
+
+    rsi_shift: Optional[str] = None
+    if rsi_prev_3 is not None and rsi_14 is not None:
+        if rsi_prev_3 < 50 <= rsi_14:
+            rsi_shift = "bullish_shift"
+        elif rsi_prev_3 > 50 >= rsi_14:
+            rsi_shift = "bearish_shift"
 
     mom_raw: Optional[float] = None
     mom_norm: Optional[float] = None
@@ -198,6 +224,40 @@ def _build_momentum_block(
         mom_raw = closes[-1] - closes[-1 - lookback]
         if atr and atr > 0:
             mom_norm = mom_raw / atr
+
+    # --- Momentum behavior ---
+    mom_prev_3_norm: Optional[float] = None
+    mom_slope_3: Optional[float] = None
+
+    if len(closes) > lookback + 3 and atr and atr > 0:
+        prev_raw = closes[-4] - closes[-4 - lookback]
+        mom_prev_3_norm = prev_raw / atr
+
+    if mom_norm is not None and mom_prev_3_norm is not None:
+        mom_slope_3 = mom_norm - mom_prev_3_norm
+
+    mom_regime: Optional[str] = None
+    if mom_norm is not None:
+        if mom_norm > 0.25:
+            mom_regime = "bullish"
+        elif mom_norm < -0.25:
+            mom_regime = "bearish"
+        else:
+            mom_regime = "neutral"
+
+    mom_strength: Optional[str] = None
+    if mom_norm is not None:
+        abs_m = abs(mom_norm)
+        if abs_m < 0.25:
+            mom_strength = "weak"
+        elif abs_m < 0.75:
+            mom_strength = "normal"
+        elif abs_m < 1.5:
+            mom_strength = "strong"
+        else:
+            mom_strength = "extreme"
+
+    mom_exhaustion = bool(mom_norm is not None and abs(mom_norm) > 1.5)
 
     macd_vals = _compute_macd(closes)
     macd_fast = macd_vals.get("macd_fast")
@@ -211,8 +271,17 @@ def _build_momentum_block(
 
     return {
         "rsi_14": rsi_14,
+        "rsi_prev_3": rsi_prev_3,
+        "rsi_slope_3": rsi_slope_3,
+        "rsi_regime": rsi_regime,
+        "rsi_shift": rsi_shift,
         "mom_raw": mom_raw,
         "mom_norm": mom_norm,
+        "mom_prev_3_norm": mom_prev_3_norm,
+        "mom_slope_3": mom_slope_3,
+        "mom_regime": mom_regime,
+        "mom_strength": mom_strength,
+        "mom_exhaustion": mom_exhaustion,
         "macd_fast": macd_fast,
         "macd_slow": macd_slow,
         "macd_signal": macd_signal,
