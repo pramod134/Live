@@ -1324,6 +1324,31 @@ def evaluate_bos_fvg_ltf(
             state["fvg_info"] = None
             _direct_state_log("phase1_bos_updated", state, bos_ts=candidate_bos.get("bos_ts"))
 
+    if state.get("phase") == "phase1_setup" and state.get("bos_info") and not state.get("fvg_info"):
+        bos_dt = _parse_ts((state.get("bos_info") or {}).get("bos_ts"))
+        fvg = _select_first_post_bos_fvg(fvg_source or [], state.get("side"), bos_dt)
+        if fvg:
+            fvg_score, trade_score, fvg_score_src, trade_score_src = _extract_fvg_score_fields(fvg)
+            state["fvg_info"] = {
+                "created_ts": fvg.get("created_ts"),
+                "direction": fvg.get("direction"),
+                "low": _safe_float(fvg.get("low")),
+                "high": _safe_float(fvg.get("high")),
+                "filled": bool(fvg.get("filled", False)),
+                "filled_ts": fvg.get("filled_ts"),
+                "fvg_score": fvg_score,
+                "trade_score": trade_score,
+                "fvg_score_src": fvg_score_src,
+                "trade_score_src": trade_score_src,
+            }
+            _direct_state_log(
+                "phase1_fvg_selected",
+                state,
+                fvg_ts=fvg.get("created_ts"),
+                fvg_low=_safe_float(fvg.get("low")),
+                fvg_high=_safe_float(fvg.get("high")),
+            )
+
     if state.get("phase") == "phase1_setup":
         if not state.get("bos_info") or not state.get("fvg_info"):
             return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase1_waiting_for_bos_or_fvg")
