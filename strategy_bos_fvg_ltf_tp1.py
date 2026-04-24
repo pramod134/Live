@@ -129,7 +129,7 @@ def _safe_bool_env(name: str, default: bool) -> bool:
     if val in {"0", "false", "f", "no", "n", "off"}:
         return False
     if DEBUG_LOGS:
-        print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
+        print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
     return default
 
 
@@ -140,7 +140,7 @@ def _safe_float_env(name: str, default: float) -> float:
     val = _safe_float(raw)
     if val is None:
         if DEBUG_LOGS:
-            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
         return default
     return val
 
@@ -153,7 +153,7 @@ def _safe_int_env(name: str, default: int) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         if DEBUG_LOGS:
-            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
         return default
 
 
@@ -305,7 +305,7 @@ def _bridge_trade_log(action: str, row: Dict[str, Any], reason: str) -> None:
                 setup_id = tag.split(":", 1)[1]
                 break
     print(
-        f"[BOS-FVG-DB][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
+        f"[BOS-FVG-DB-TP1][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
         f"ID={setup_id} | Leg={row.get('leg')} | Trade={row.get('trade')} | Entry={row.get('entry_level')} | "
         f"SL={row.get('sl_level')} | Status={row.get('status')} | Manage={row.get('manage')} | Reason={reason}"
     )
@@ -550,7 +550,7 @@ def _log_value(value: Any) -> str:
 
 
 def _db_state_log(symbol: str, timeframe: str, stage: str, **fields: Any) -> None:
-    parts = [f"[BOS-FVG-DB][STATE] Stage={stage}", f"Symbol={symbol}", f"TF={timeframe}"]
+    parts = [f"[BOS-FVG-DB-TP1][STATE] Stage={stage}", f"Symbol={symbol}", f"TF={timeframe}"]
     for k, v in fields.items():
         parts.append(f"{k}={_log_value(v)}")
     print(" | ".join(parts))
@@ -712,7 +712,7 @@ def get_live_bridge_rows() -> List[Dict[str, Any]]:
 
 def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
     parts = [
-        f"[BOS-FVG-DB][STATE] Stage={stage}",
+        f"[BOS-FVG-DB-TP1][STATE] Stage={stage}",
         f"Symbol={state.get('symbol')}",
         f"TF={state.get('timeframe')}",
         f"mode={state.get('mode')}",
@@ -729,10 +729,12 @@ def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
 
 
 def _new_trade_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    allowed = {
+    columns = [
         "symbol",
         "asset_type",
         "cp",
+        "strike",
+        "expiry",
         "qty",
         "entry_type",
         "entry_cond",
@@ -745,24 +747,28 @@ def _new_trade_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "tp_type",
         "tp_level",
         "note",
-        "tags",
         "trade_type",
-        "end_time",
         "entry_time",
-    }
+        "end_time",
+        "tags",
+    ]
+
     payloads: List[Dict[str, Any]] = []
+
     for row in rows or []:
         setup_id = str(row.get("setup_id") or "").strip()
-        payload = {
-            "note": f"bridge:{setup_id}" if setup_id else "bridge:",
-            "trade_type": "swing",
-        }
-        for key in allowed:
-            if key in payload:
+
+        payload = {col: None for col in columns}
+        payload["note"] = f"bridge:{setup_id}" if setup_id else "bridge:"
+        payload["trade_type"] = "swing"
+
+        for col in columns:
+            if col in {"note", "trade_type"}:
                 continue
-            if row.get(key) is not None:
-                payload[key] = row.get(key)
+            payload[col] = row.get(col)
+
         payloads.append(payload)
+
     return payloads
 
 
@@ -1111,10 +1117,10 @@ def evaluate_bos_fvg_ltf_tp1(
 
     if long_bos_detected and swing_high_key:
         state["broken_swing_highs"].add(swing_high_key)
-        print(f"[BOS-FVG-DB] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
+        print(f"[BOS-FVG-DB-TP1] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
     if short_bos_detected and swing_low_key:
         state["broken_swing_lows"].add(swing_low_key)
-        print(f"[BOS-FVG-DB] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
+        print(f"[BOS-FVG-DB-TP1] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
 
     chosen_side = "none"
     chosen_bos_detected = False
