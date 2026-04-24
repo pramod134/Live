@@ -1860,6 +1860,11 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
         logger.info("simulation cancelled for symbol=%s", symbol)
         msg = "cancelled"
         try:
+            try:
+                await bot._flush_sim_spot_events(symbol)
+            except Exception as spot_events_err:
+                logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+
             await bot.flush_tick_tf(symbol)
             event_counters, event_candles = _build_event_payloads()
             parsed_tf_summaries = _parse_final_summary_lines(log_local_path)
@@ -1913,6 +1918,11 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         logger.exception("simulation failed for symbol=%s: %s", symbol, msg)
+        try:
+            await bot._flush_sim_spot_events(symbol)
+        except Exception as spot_events_err:
+            logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+
         try:
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)
             set_bos_fvg_ltf_tp1_runtime_mode(execution_enabled=True, live_mode=True)
