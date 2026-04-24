@@ -1720,11 +1720,12 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                 try:
                     await bot._flush_sim_spot_events(symbol)
                 except Exception as spot_events_err:
-                    logger.warning(
-                        "spot_events flush failed at catchup->live handoff for %s: %s",
-                        symbol,
-                        spot_events_err,
-                    )
+                    # logger.warning(
+                    #     "spot_events flush failed at catchup->live handoff for %s: %s",
+                    #     symbol,
+                    #     spot_events_err,
+                    # )
+                    pass
                 await bot.flush_tick_tf(symbol)
             else:
                 print(
@@ -1871,7 +1872,8 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
             try:
                 await bot._flush_sim_spot_events(symbol)
             except Exception as spot_events_err:
-                logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+                # logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+                pass
 
             await bot.flush_tick_tf(symbol)
             event_counters, event_candles = _build_event_payloads()
@@ -1929,7 +1931,8 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
         try:
             await bot._flush_sim_spot_events(symbol)
         except Exception as spot_events_err:
-            logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+            # logger.warning("spot_events flush failed for %s: %s", symbol, spot_events_err)
+            pass
 
         try:
             set_bos_fvg_ltf_runtime_mode(execution_enabled=True, live_mode=True)

@@ -1469,8 +1469,9 @@ class IndicatorBot:
         # print(f"[INDICATOR_BOT][DIAG] liquidity_builder_calls_by_tf={self._liq_builder_calls_by_tf}")
         # Spot-event per-event trigger counters (printed by spot_event module)
         try:
-            from spot_event import print_spot_event_counters  # local import to avoid cycles
-            print_spot_event_counters()
+            # from spot_event import print_spot_event_counters  # local import to avoid cycles
+            # print_spot_event_counters()
+            pass
         except Exception as e:
             pass
             # print(f"[INDICATOR_BOT][DIAG] spot_event counters unavailable: {e}")
@@ -1490,8 +1491,9 @@ class IndicatorBot:
         # print(f"[INDICATOR_BOT][DIAG] liquidity_builder_calls_by_tf={self._liq_builder_calls_by_tf}")
         # Spot-event per-event trigger counters (printed by spot_event module)
         try:
-            from spot_event import print_spot_event_counters  # local import to avoid cycles
-            print_spot_event_counters()
+            # from spot_event import print_spot_event_counters  # local import to avoid cycles
+            # print_spot_event_counters()
+            pass
         except Exception as e:
             pass
             # print(f"[INDICATOR_BOT][DIAG] spot_event counters unavailable: {e}")
@@ -1567,9 +1569,9 @@ class IndicatorBot:
         # print(f"[INDICATOR_BOT][DIAG] liquidity_builder_calls_by_tf={self._liq_builder_calls_by_tf}")
 
         try:
-            from spot_event import print_spot_event_counters  # local import to avoid cycles
-
-            print_spot_event_counters()
+            # from spot_event import print_spot_event_counters  # local import to avoid cycles
+            # print_spot_event_counters()
+            pass
         except Exception:
             pass
 
