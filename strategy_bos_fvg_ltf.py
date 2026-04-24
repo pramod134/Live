@@ -727,11 +727,14 @@ def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
     print(" | ".join(parts))
 
 
+
 def _new_trade_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    allowed = {
+    columns = [
         "symbol",
         "asset_type",
         "cp",
+        "strike",
+        "expiry",
         "qty",
         "entry_type",
         "entry_cond",
@@ -744,25 +747,31 @@ def _new_trade_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "tp_type",
         "tp_level",
         "note",
-        "tags",
         "trade_type",
-        "end_time",
         "entry_time",
-    }
+        "end_time",
+        "tags",
+    ]
+
     payloads: List[Dict[str, Any]] = []
+
     for row in rows or []:
         setup_id = str(row.get("setup_id") or "").strip()
-        payload = {
-            "note": f"bridge:{setup_id}" if setup_id else "bridge:",
-            "trade_type": "swing",
-        }
-        for key in allowed:
-            if key in payload:
+
+        payload = {col: None for col in columns}
+        payload["note"] = f"bridge:{setup_id}" if setup_id else "bridge:"
+        payload["trade_type"] = "swing"
+
+        for col in columns:
+            if col in {"note", "trade_type"}:
                 continue
-            if row.get(key) is not None:
-                payload[key] = row.get(key)
+            payload[col] = row.get(col)
+
         payloads.append(payload)
+
     return payloads
+
+
 
 
 def _clear_direct_setup(state: Dict[str, Any]) -> None:
