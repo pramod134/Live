@@ -1717,6 +1717,14 @@ async def _run_claimed_job(client: httpx.AsyncClient, job: Dict[str, Any]) -> in
                     f"last_processed_ts={_ts_str(last_processed_ts)} | "
                     f"batches={catchup_batches} | rows_total={catchup_rows_total}"
                 )
+                try:
+                    await bot._flush_sim_spot_events(symbol)
+                except Exception as spot_events_err:
+                    logger.warning(
+                        "spot_events flush failed at catchup->live handoff for %s: %s",
+                        symbol,
+                        spot_events_err,
+                    )
                 await bot.flush_tick_tf(symbol)
             else:
                 print(
