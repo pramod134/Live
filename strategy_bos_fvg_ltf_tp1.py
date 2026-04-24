@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from db_worker import db_insert_raw, active_trades_checker, active_cleanup, db_updater
 
 
 
@@ -15,6 +16,7 @@ _ET = ZoneInfo("America/New_York")
 DEBUG_LOGS = str(os.getenv("BOS_FVG_DEBUG_LOGS", "0")).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 ENTRY_LEG_SHARES = 100
 BRIDGE_VERSION = (os.getenv("BOS_FVG_LTF_VERSION") or "v1").strip() or "v1"
+STRATEGY_NAME = "bos_fvg_ltf_tp1"
 _RUNTIME_MODE: Dict[str, Any] = {
     "execution_enabled": True,
     "live_mode": True,
@@ -127,7 +129,7 @@ def _safe_bool_env(name: str, default: bool) -> bool:
     if val in {"0", "false", "f", "no", "n", "off"}:
         return False
     if DEBUG_LOGS:
-        print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
+        print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
     return default
 
 
@@ -138,7 +140,7 @@ def _safe_float_env(name: str, default: float) -> float:
     val = _safe_float(raw)
     if val is None:
         if DEBUG_LOGS:
-            print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
         return default
     return val
 
@@ -151,7 +153,7 @@ def _safe_int_env(name: str, default: int) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         if DEBUG_LOGS:
-            print(f"[BOS-FVG-DB-TP1] env fallback used for {name}: {raw!r}")
+            print(f"[BOS-FVG-DB] env fallback used for {name}: {raw!r}")
         return default
 
 
@@ -237,6 +239,18 @@ def _ensure_state(symbol: str, timeframe: str) -> Dict[str, Any]:
         cfg = _default_cfg()
         _BOS_FVG_LTF_STATE[key] = {
             "config": cfg,
+            "mode": "sim",
+            "phase": None,
+            "strategy": STRATEGY_NAME,
+            "version": BRIDGE_VERSION,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "setup_id": None,
+            "side": None,
+            "bos_info": None,
+            "fvg_info": None,
+            "swing_info": None,
+            "new_bos_info": None,
             "pending_setup": None,
             "pending_rearm_setup": None,
             "deferred_bos": None,
@@ -258,6 +272,7 @@ def _ensure_state(symbol: str, timeframe: str) -> Dict[str, Any]:
 
 
 def _deterministic_setup_id(
+    strategy_name: str,
     symbol: str,
     timeframe: str,
     bos_ts: Any,
@@ -268,10 +283,11 @@ def _deterministic_setup_id(
 ) -> str:
     bos_ts_s = str(bos_ts or "")
     stable = "|".join([
+        strategy_name,
+        version,
         symbol,
         timeframe,
         bos_ts_s,
-        version,
         str(side or ""),
         f"{_safe_float(fvg_high, 0.0):.8f}",
         f"{_safe_float(fvg_low, 0.0):.8f}",
@@ -289,7 +305,7 @@ def _bridge_trade_log(action: str, row: Dict[str, Any], reason: str) -> None:
                 setup_id = tag.split(":", 1)[1]
                 break
     print(
-        f"[BOS-FVG-DB-TP1][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
+        f"[BOS-FVG-DB][TRADE_STATE_LOG] ACTION={action} | Symbol={row.get('symbol')} | TF={row.get('entry_tf')} | "
         f"ID={setup_id} | Leg={row.get('leg')} | Trade={row.get('trade')} | Entry={row.get('entry_level')} | "
         f"SL={row.get('sl_level')} | Status={row.get('status')} | Manage={row.get('manage')} | Reason={reason}"
     )
@@ -309,7 +325,7 @@ def _bridge_insert_rows(
     fvg_high: Optional[float],
     fvg_low: Optional[float],
 ) -> Optional[str]:
-    setup_id = _deterministic_setup_id(symbol, timeframe, bos_ts, version, side, fvg_high, fvg_low)
+    setup_id = _deterministic_setup_id(strategy_name, symbol, timeframe, bos_ts, version, side, fvg_high, fvg_low)
     if setup_id in state["bridge_setup_index"]:
         return None
 
@@ -320,10 +336,8 @@ def _bridge_insert_rows(
     MIN_TRADE3_RISK = 0.60
     TP_RR_MAP = {
         (1, 3): 1.0,  # LEG1 T3
-
         (2, 2): 2.0,  # LEG2 T2
         (2, 3): 1.5,  # LEG2 T3
-
         (3, 1): 1.0,  # LEG3 T1
         (3, 2): 1.5,  # LEG3 T2
         (3, 3): 1.5,  # LEG3 T3
@@ -536,7 +550,7 @@ def _log_value(value: Any) -> str:
 
 
 def _db_state_log(symbol: str, timeframe: str, stage: str, **fields: Any) -> None:
-    parts = [f"[BOS-FVG-DB-TP1][STATE] Stage={stage}", f"Symbol={symbol}", f"TF={timeframe}"]
+    parts = [f"[BOS-FVG-DB][STATE] Stage={stage}", f"Symbol={symbol}", f"TF={timeframe}"]
     for k, v in fields.items():
         parts.append(f"{k}={_log_value(v)}")
     print(" | ".join(parts))
@@ -693,10 +707,164 @@ def _finalize_manage_c_cleanup(
 
 
 def get_live_bridge_rows() -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for state in _BOS_FVG_LTF_STATE.values():
-        rows.extend(deepcopy(state.get("bridge_rows") or []))
-    return rows
+    return []
+
+
+def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
+    parts = [
+        f"[BOS-FVG-DB][STATE] Stage={stage}",
+        f"Symbol={state.get('symbol')}",
+        f"TF={state.get('timeframe')}",
+        f"mode={state.get('mode')}",
+        f"phase={state.get('phase')}",
+        f"setup_id={state.get('setup_id')}",
+        f"side={state.get('side')}",
+        f"bos={state.get('bos_info') is not None}",
+        f"fvg={state.get('fvg_info') is not None}",
+        f"new_bos={state.get('new_bos_info') is not None}",
+    ]
+    for k, v in extra.items():
+        parts.append(f"{k}={_log_value(v)}")
+    print(" | ".join(parts))
+
+
+def _new_trade_payloads(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    allowed = {
+        "symbol",
+        "asset_type",
+        "cp",
+        "qty",
+        "entry_type",
+        "entry_cond",
+        "entry_level",
+        "entry_tf",
+        "sl_type",
+        "sl_cond",
+        "sl_level",
+        "sl_tf",
+        "tp_type",
+        "tp_level",
+        "note",
+        "tags",
+        "trade_type",
+        "end_time",
+        "entry_time",
+    }
+    payloads: List[Dict[str, Any]] = []
+    for row in rows or []:
+        setup_id = str(row.get("setup_id") or "").strip()
+        payload = {
+            "note": f"bridge:{setup_id}" if setup_id else "bridge:",
+            "trade_type": "swing",
+        }
+        for key in allowed:
+            if key in payload:
+                continue
+            if row.get(key) is not None:
+                payload[key] = row.get(key)
+        payloads.append(payload)
+    return payloads
+
+
+def _clear_direct_setup(state: Dict[str, Any]) -> None:
+    state["phase"] = "phase1_setup"
+    state["setup_id"] = None
+    state["side"] = None
+    state["bos_info"] = None
+    state["fvg_info"] = None
+    state["swing_info"] = None
+    state["new_bos_info"] = None
+    state["bridge_current_setup_id"] = None
+
+
+def _active_tag_value(row: Dict[str, Any], prefix: str) -> Optional[str]:
+    tags = row.get("tags") or []
+    want = f"{prefix}:"
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith(want):
+            return tag.split(":", 1)[1].strip() or None
+    return None
+
+
+def _bridge_rows_from_active(
+    state: Dict[str, Any],
+    setup_id: str,
+    active_rows: List[Dict[str, Any]],
+    *,
+    trade_number: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    active_keys = set()
+    for row in active_rows or []:
+        is_managing = (
+            str(row.get("manage") or "") == "O"
+            or (
+                str(row.get("status") or "") == "nt-managing"
+                and str(row.get("manage") or "") == "Y"
+            )
+        )
+        if not is_managing:
+            continue
+        leg = _safe_int(_active_tag_value(row, "leg"), 0)
+        trade = _safe_int(_active_tag_value(row, "trade"), 0)
+        if leg <= 0 or trade <= 0:
+            continue
+        if trade_number is not None and trade != trade_number:
+            continue
+        active_keys.add((leg, trade))
+
+    return [
+        r for r in _bridge_setup_rows(state, setup_id)
+        if (_safe_int(r.get("leg"), 0), _safe_int(r.get("trade"), 0)) in active_keys
+    ]
+
+
+def _patch_sl_rows(state: Dict[str, Any], rows: List[Dict[str, Any]], sl_level: float, reason: str) -> None:
+    for row in rows or []:
+        if row.get("sl_level") == sl_level:
+            continue
+        row["sl_level"] = sl_level
+        _bridge_trade_log("UPDATE", row, reason)
+        db_updater(
+            strategy=state["strategy"],
+            version=state["version"],
+            setup_id=state["setup_id"],
+            leg=row.get("leg"),
+            trade=row.get("trade"),
+            sl_level=sl_level,
+            log_label=state["strategy"],
+        )
+
+
+def _direct_snapshot(
+    state: Dict[str, Any],
+    *,
+    last_ts: Optional[str],
+    last_ts_et: Optional[str],
+    status: str,
+    skip_reason: str,
+) -> Dict[str, Any]:
+    snapshot = {
+        "id": state.get("strategy"),
+        "symbol": state.get("symbol"),
+        "timeframe": state.get("timeframe"),
+        "last_eval_ts": last_ts,
+        "last_eval_ts_et": last_ts_et,
+        "status": status,
+        "skip_reason": skip_reason,
+        "phase": state.get("phase"),
+        "setup_id": state.get("setup_id"),
+        "side": state.get("side"),
+        "bos_info": deepcopy(state.get("bos_info")),
+        "fvg_info": deepcopy(state.get("fvg_info")),
+        "new_bos_info": deepcopy(state.get("new_bos_info")),
+        "signal_count": len(state.get("signals") or []),
+        "last_signal": deepcopy((state.get("signals") or [])[-1] if state.get("signals") else None),
+        "execution_enabled": state.get("mode") == "live",
+        "live_mode": state.get("mode") == "live",
+    }
+    state["latest_snapshot"] = snapshot
+    _direct_state_log("eval_return", state, status=status, skip_reason=skip_reason)
+    return snapshot
 
 
 def apply_live_bridge_db_state(updates: List[Dict[str, Any]]) -> None:
@@ -943,10 +1111,10 @@ def evaluate_bos_fvg_ltf_tp1(
 
     if long_bos_detected and swing_high_key:
         state["broken_swing_highs"].add(swing_high_key)
-        print(f"[BOS-FVG-DB-TP1] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
+        print(f"[BOS-FVG-DB] BOS detected LONG | Symbol={symbol} | TF={timeframe} | Break={recent_high_price}")
     if short_bos_detected and swing_low_key:
         state["broken_swing_lows"].add(swing_low_key)
-        print(f"[BOS-FVG-DB-TP1] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
+        print(f"[BOS-FVG-DB] BOS detected SHORT | Symbol={symbol} | TF={timeframe} | Break={recent_low_price}")
 
     chosen_side = "none"
     chosen_bos_detected = False
@@ -1036,689 +1204,255 @@ def evaluate_bos_fvg_ltf_tp1(
             **deferred_dbg,
         )
 
-    # ------------------------------------------------------------
-    # Catch-up invalidation rules
-    # 1) If selected FVG becomes filled in catch-up, invalidate setup
-    #    and go back to waiting for a new BOS.
-    # 2) If a new BOS occurs while a setup is pending in catch-up,
-    #    invalidate the old setup immediately and track the new BOS.
-    # ------------------------------------------------------------
-    pending = state.get("pending_setup")
-    if pending and (not execution_enabled or not live_mode):
-        selected_fvg = pending.get("fvg")
-        if isinstance(selected_fvg, dict):
-            selected_fvg, _matched_fvg = _refresh_selected_fvg_fields(selected_fvg, fvgs or [])
-            pending["fvg"] = selected_fvg
-            if DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "fvg_refresh_existing",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    fvg_ts=selected_fvg.get("created_ts"),
-                    fvg_filled=bool(selected_fvg.get("filled")),
-                    trade_score=selected_fvg.get("trade_score"),
-                )
-            if bool(selected_fvg.get("filled")):
-                _clear_pending_setup_for_new_bos(
-                    state,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reason="catchup_fvg_filled",
-                )
-                state["pending_rearm_setup"] = None
-                pending = None
+    state["mode"] = "live" if execution_enabled and live_mode else "sim"
 
-    pending = state.get("pending_setup")
+    fvg_source = fvgs if isinstance(fvgs, list) else (last_candle.get("fvgs") if isinstance(last_candle.get("fvgs"), list) else [])
 
     # ------------------------------------------------------------
-    # Live-boundary materialization:
-    # If catch-up already formed a pending setup + selected FVG, the
-    # first live candle is allowed to materialize Phase 1 by creating
-    # bridge rows at that point.
+    # Direct DB lifecycle mode.
+    # BOS/FVG detection above this point is unchanged.
     # ------------------------------------------------------------
-    pending = state.get("pending_setup")
-    if (
-        pending
-        and execution_enabled
-        and live_mode
-        and pending.get("fvg")
-        and not pending.get("setup_id")
-    ):
-        fvg_now = pending.get("fvg") or {}
-        setup_id = _bridge_insert_rows(
-            state=state,
-            symbol=symbol,
-            timeframe=timeframe,
-            side=pending.get("side"),
-            version=BRIDGE_VERSION,
-            strategy_name="bos_fvg_ltf_tp1",
-            bos_ts=pending.get("bos_ts"),
-            fvg_high=_safe_float(fvg_now.get("high")),
-            fvg_low=_safe_float(fvg_now.get("low")),
-        )
-        pending["setup_id"] = setup_id or _deterministic_setup_id(
+
+    if state["mode"] == "sim":
+        state["phase"] = None
+        state["setup_id"] = None
+        state["new_bos_info"] = None
+
+        if candidate_bos is not None:
+            state["bos_info"] = deepcopy(candidate_bos)
+            state["side"] = candidate_bos.get("side")
+            state["swing_info"] = {
+                "entry_ref_swing_high": candidate_bos.get("entry_ref_swing_high"),
+                "entry_ref_swing_high_ts": candidate_bos.get("entry_ref_swing_high_ts"),
+                "entry_ref_swing_high_score": candidate_bos.get("entry_ref_swing_high_score"),
+                "entry_ref_swing_low": candidate_bos.get("entry_ref_swing_low"),
+                "entry_ref_swing_low_ts": candidate_bos.get("entry_ref_swing_low_ts"),
+                "entry_ref_swing_low_score": candidate_bos.get("entry_ref_swing_low_score"),
+            }
+            state["fvg_info"] = None
+            _direct_state_log("sim_bos_updated", state, bos_ts=candidate_bos.get("bos_ts"))
+
+        if state.get("bos_info") and not state.get("fvg_info"):
+            bos_dt = _parse_ts((state.get("bos_info") or {}).get("bos_ts"))
+            fvg = _select_first_post_bos_fvg(fvg_source or [], state.get("side"), bos_dt)
+            if fvg:
+                fvg_score, trade_score, fvg_score_src, trade_score_src = _extract_fvg_score_fields(fvg)
+                state["fvg_info"] = {
+                    "created_ts": fvg.get("created_ts"),
+                    "direction": fvg.get("direction"),
+                    "low": _safe_float(fvg.get("low")),
+                    "high": _safe_float(fvg.get("high")),
+                    "filled": bool(fvg.get("filled", False)),
+                    "filled_ts": fvg.get("filled_ts"),
+                    "fvg_score": fvg_score,
+                    "trade_score": trade_score,
+                    "fvg_score_src": fvg_score_src,
+                    "trade_score_src": trade_score_src,
+                }
+                _direct_state_log("sim_fvg_selected", state, fvg_ts=fvg.get("created_ts"))
+
+        return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="sim", skip_reason="sim_mode")
+
+    if state["mode"] == "live" and state.get("phase") is None:
+        state["phase"] = "phase1_setup"
+        _direct_state_log("live_start", state)
+
+    if state.get("phase") == "phase1_setup":
+        if not state.get("bos_info") or not state.get("fvg_info"):
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase1_waiting_for_bos_or_fvg")
+
+        setup_id = _deterministic_setup_id(
+            state["strategy"],
             symbol,
             timeframe,
-            pending.get("bos_ts"),
+            (state["bos_info"] or {}).get("bos_ts"),
             BRIDGE_VERSION,
-            pending.get("side"),
-            _safe_float(fvg_now.get("high")),
-            _safe_float(fvg_now.get("low")),
+            state.get("side"),
+            _safe_float((state["fvg_info"] or {}).get("high")),
+            _safe_float((state["fvg_info"] or {}).get("low")),
         )
-        pending["notes"] = "live_materialized_from_existing_pending_setup"
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "live_boundary_materialize_pending_setup",
-                trade_id=pending.get("trade_id"),
-                setup_id=pending.get("setup_id"),
-                fvg_ts=fvg_now.get("created_ts"),
-            )
+        state["setup_id"] = setup_id
 
-    # ------------------------------------------------------------
-    # Phase 2 -> Phase 3 transition handling (runs every candle)
-    # ------------------------------------------------------------
-    # Once ANY matching active row is nt-managing, this setup is LIVE.
-    # At that point it must no longer remain as a pending/armed setup.
-    pending = state.get("pending_setup")
-    if pending and pending.get("setup_id"):
-        pending_setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
-        pending_live_rows = [r for r in pending_setup_rows if r.get("db_active_status") == "nt-managing"]
-        if pending_live_rows:
-            if DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "phase2_to_phase3_live_detected",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    managing_rows=len(pending_live_rows),
-                    waiting_rows=sum(1 for r in pending_setup_rows if r.get("db_active_status") == "nt-waiting"),
-                )
-            state["pending_setup"] = None
-            state["pending_rearm_setup"] = None
-            setup_meta = (state.get("bridge_setup_index") or {}).get(pending.get("setup_id")) or {}
-            setup_meta["bridge_live_phase_entered"] = True
-            pending = None
-            status = "live"
-            skip_reason = ""
-
-    # Setup state management
-    if cfg["enabled"] and chosen_bos_detected and chosen_score_pass and cfg["max_open_positions"] >= 1:
-        pending = state["pending_setup"]
-        if pending:
-            # In catch-up, a new BOS invalidates the current pending setup
-            # immediately. Then we proceed to publish the new BOS as the new
-            # pending setup below.
-            if not execution_enabled or not live_mode:
-                _clear_pending_setup_for_new_bos(
-                    state,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reason="catchup_new_bos_replaces_pending",
-                    new_side=chosen_side,
-                    new_bos_ts=last_ts,
-                )
-                state["pending_rearm_setup"] = None
-                pending = None
-
-        if pending:
-            scope_rows = _bridge_scope_rows(
-                state,
+        existing_rows = _bridge_setup_rows(state, setup_id)
+        if existing_rows:
+            rows = existing_rows
+        else:
+            _bridge_insert_rows(
+                state=state,
                 symbol=symbol,
                 timeframe=timeframe,
-                strategy_name="bos_fvg_ltf_tp1",
+                side=state.get("side"),
                 version=BRIDGE_VERSION,
+                strategy_name=state["strategy"],
+                bos_ts=(state["bos_info"] or {}).get("bos_ts"),
+                fvg_high=_safe_float((state["fvg_info"] or {}).get("high")),
+                fvg_low=_safe_float((state["fvg_info"] or {}).get("low")),
             )
-            pending_setup_rows = _bridge_setup_rows(state, pending.get("setup_id"))
-            awaiting_insert_confirmation = bool(
-                pending.get("setup_id")
-                and pending_setup_rows
-                and not all(bool(r.get("db_new_insert_confirmed")) for r in pending_setup_rows)
-            )
-            if DEBUG_LOGS:
-                scope_dbg = _bridge_counts(scope_rows)
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "bos_with_existing_pending",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    pending_side=pending.get("side"),
-                    chosen_side=chosen_side,
-                    has_live_rows=any(r.get("db_active_status") == "nt-managing" for r in scope_rows),
-                    **scope_dbg,
-                    **_rearm_summary(state.get("pending_rearm_setup")),
-                )
-            has_live_rows = any(r.get("db_active_status") == "nt-managing" for r in scope_rows)
-            if awaiting_insert_confirmation:
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "phase2_rearm_blocked_awaiting_new_trades_insert_confirmation",
-                        trade_id=pending.get("trade_id"),
-                        setup_id=pending.get("setup_id"),
-                        confirmed_rows=sum(1 for r in pending_setup_rows if bool(r.get("db_new_insert_confirmed"))),
-                        total_rows=len(pending_setup_rows),
-                    )
-            elif not has_live_rows:
-                state["pending_rearm_setup"] = {
-                    "side": chosen_side,
-                    "bos_ts": last_ts,
-                    "bos_ts_et": last_ts_et,
-                    "entry_ref_swing_high": recent_high_price,
-                    "entry_ref_swing_high_ts": recent_high_ts,
-                    "entry_ref_swing_high_score": recent_high_pivot_score,
-                    "entry_ref_swing_low": recent_low_price,
-                    "entry_ref_swing_low_ts": recent_low_ts,
-                    "entry_ref_swing_low_score": recent_low_pivot_score,
-                    "score_total": chosen_score_total,
-                    "score_pass": chosen_score_pass,
-                    "momentum_pass": chosen_momentum_pass,
-                    "volume_pass": chosen_volume_pass,
-                    "close_pass": chosen_close_pass,
-                    "break_pass": chosen_break_pass,
-                    "mom_value": mom_val,
-                    "vol_value": vol_val,
-                    "close_strength_value": chosen_close_strength,
-                    "break_distance_value": chosen_break_distance,
-                    "structure_state_tf": structure_state_tf,
-                    "structure_state_15m": structure_state_15m,
-                    "structure_state_1h": structure_state_1h,
-                }
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "pending_rearm_stored",
-                        old_trade_id=pending.get("trade_id"),
-                        old_setup_id=pending.get("setup_id"),
-                        new_side=chosen_side,
-                        new_bos_ts=last_ts,
-                    )
-                waiting_rows = [
-                    r for r in scope_rows
-                    if r.get("db_active_seen")
-                    and r.get("db_active_status") == "nt-waiting"
-                    and str(r.get("manage") or "") != "C"
-                ]
-                if waiting_rows:
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol,
-                            timeframe,
-                            "phase2_case2_cancel_request",
-                            trade_id=pending.get("trade_id"),
-                            setup_id=pending.get("setup_id"),
-                            waiting_rows=len(waiting_rows),
-                            waiting_leg_trades=",".join(
-                                f"{_safe_int(r.get('leg'), 0)}-{_safe_int(r.get('trade'), 0)}"
-                                for r in waiting_rows
-                            ),
-                        )
-                    changed = _bridge_update_rows(waiting_rows, {"manage": "C"}, "phase2_case2_cancel")
-                    if changed:
-                        _begin_manage_c_cleanup(
-                            state,
-                            setup_id=pending.get("setup_id"),
-                            source="phase2_case2_cancel",
-                            rows=waiting_rows,
-                            clear_pending_setup=True,
-                        )
-                    pending["cancel_requested"] = True
-                else:
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol,
-                            timeframe,
-                            "phase2_case2_cancel_skipped_no_waiting_rows",
-                            trade_id=pending.get("trade_id"),
-                            setup_id=pending.get("setup_id"),
-                            **_bridge_counts(scope_rows),
-                        )
-                    old_setup_id = pending.get("setup_id")
-                    state["pending_setup"] = None
-                    if state.get("bridge_current_setup_id") == old_setup_id:
-                        state["bridge_current_setup_id"] = None
-                    setup_meta = (state.get("bridge_setup_index") or {}).get(old_setup_id) or {}
-                    setup_meta["bridge_live_phase_entered"] = False
-                    pending = None
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol,
-                            timeframe,
-                            "phase2_to_phase1_rearm_ready_no_waiting_rows",
-                            source="no_waiting_rows",
-                            old_setup_id=old_setup_id,
-                        )
-            elif DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "rearm_blocked_live_rows_present",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    **_bridge_counts(scope_rows),
-                )
+            rows = _bridge_setup_rows(state, setup_id)
 
-        if not state.get("pending_setup"):
-            rearm = state.get("pending_rearm_setup")
-            # Do not publish a new Phase-1 setup while the current DB-owned setup
-            # is still live or still awaiting Phase-3 cleanup confirmation.
-            bridge_blocks_new_setup = False
-            bridge_block_reason = None
-            current_bridge_setup_id = state.get("bridge_current_setup_id")
-            current_bridge_rows = _bridge_setup_rows(state, current_bridge_setup_id)
-            current_bridge_meta = (state.get("bridge_setup_index") or {}).get(current_bridge_setup_id) or {}
-            if current_bridge_rows:
-                current_has_managing = any(r.get("db_active_status") == "nt-managing" for r in current_bridge_rows)
-                current_waiting_uncancelled = any(
-                    r.get("db_active_seen")
-                    and r.get("db_active_status") == "nt-waiting"
-                    and str(r.get("db_active_manage") or "") != "C"
-                    for r in current_bridge_rows
-                )
-                current_live_phase_entered = bool(current_bridge_meta.get("bridge_live_phase_entered"))
-                if current_has_managing:
-                    bridge_blocks_new_setup = True
-                    bridge_block_reason = "current_setup_live"
-                elif current_live_phase_entered and current_waiting_uncancelled:
-                    bridge_blocks_new_setup = True
-                    bridge_block_reason = "phase3_cleanup_pending"
-            if bridge_blocks_new_setup:
-                if (
-                    candidate_bos is not None
-                    and bridge_block_reason == "current_setup_live"
-                ):
-                    state["deferred_bos"] = deepcopy(candidate_bos)
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol,
-                            timeframe,
-                            "live_bos_deferred",
-                            bridge_current_setup_id=current_bridge_setup_id,
-                            deferred_side=candidate_bos.get("side"),
-                            deferred_bos_ts=candidate_bos.get("bos_ts"),
-                            reason=bridge_block_reason,
-                        )
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol, timeframe, "new_setup_blocked_by_current_bridge_setup",
-                        bridge_current_setup_id=current_bridge_setup_id, reason=bridge_block_reason, **_bridge_counts(current_bridge_rows)
-                    )
-                rearm = None
-            deferred = state.get("deferred_bos")
-            candidate = None
-            candidate_source = None
-
-            if rearm is not None:
-                candidate = rearm
-                candidate_source = "rearm"
-            elif deferred is not None and not bridge_blocks_new_setup:
-                candidate = deferred
-                candidate_source = "deferred_bos"
-            elif candidate_bos is not None and not bridge_blocks_new_setup:
-                candidate = candidate_bos
-                candidate_source = "current_bos"
-            if candidate is not None:
-                state["trade_id_counter"] += 1
-                trade_id = f"{symbol}_{timeframe}_{state['trade_id_counter']}"
-                top_shares = ENTRY_LEG_SHARES * 2
-                mid_shares = ENTRY_LEG_SHARES * 4
-                bottom_shares = ENTRY_LEG_SHARES * 6
-                total_shares = top_shares + mid_shares + bottom_shares
-                state["pending_setup"] = {
-                    "trade_id": trade_id,
-                    "side": candidate.get("side"),
-                    "bos_ts": candidate.get("bos_ts"),
-                    "bos_ts_et": candidate.get("bos_ts_et"),
-                    "shares_total": total_shares,
-                    "entry_top_shares": top_shares,
-                    "entry_mid_shares": mid_shares,
-                    "entry_bottom_shares": bottom_shares,
-                    "entry_ref_swing_high": candidate.get("entry_ref_swing_high"),
-                    "entry_ref_swing_high_ts": candidate.get("entry_ref_swing_high_ts"),
-                    "entry_ref_swing_high_score": candidate.get("entry_ref_swing_high_score"),
-                    "entry_ref_swing_low": candidate.get("entry_ref_swing_low"),
-                    "entry_ref_swing_low_ts": candidate.get("entry_ref_swing_low_ts"),
-                    "entry_ref_swing_low_score": candidate.get("entry_ref_swing_low_score"),
-                    "score_total": candidate.get("score_total"),
-                    "score_pass": candidate.get("score_pass"),
-                    "momentum_pass": candidate.get("momentum_pass"),
-                    "volume_pass": candidate.get("volume_pass"),
-                    "close_pass": candidate.get("close_pass"),
-                    "break_pass": candidate.get("break_pass"),
-                    "mom_value": candidate.get("mom_value"),
-                    "vol_value": candidate.get("vol_value"),
-                    "close_strength_value": candidate.get("close_strength_value"),
-                    "break_distance_value": candidate.get("break_distance_value"),
-                    "structure_state_tf": candidate.get("structure_state_tf"),
-                    "structure_state_15m": candidate.get("structure_state_15m"),
-                    "structure_state_1h": candidate.get("structure_state_1h"),
-                    "fvg": None,
-                    "setup_id": None,
-                    "cancel_requested": False,
-                    "notes": "awaiting_first_same_direction_fvg_after_bos",
-                }
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "pending_setup_published",
-                        trade_id=trade_id,
-                        side=state["pending_setup"].get("side"),
-                        bos_ts=state["pending_setup"].get("bos_ts"),
-                        source=candidate_source,
-                    )
-                if candidate_source == "rearm":
-                    state["pending_rearm_setup"] = None
-                elif candidate_source == "deferred_bos":
-                    state["deferred_bos"] = None
-                if DEBUG_LOGS:
-                    print(
-                        f"[BOS-FVG-DB-TP1] setup armed | Symbol={symbol} | TF={timeframe} | TradeID={trade_id} | "
-                        f"Side={state['pending_setup'].get('side')} | BOS_TS={state['pending_setup'].get('bos_ts')} | "
-                        f"BOSScore={_safe_float(state['pending_setup'].get('score_total'), 0.0):.2f}"
-                    )
-
-    # FVG discovery
-    pending = state["pending_setup"]
-    fvg_source = fvgs if isinstance(fvgs, list) else (last_candle.get("fvgs") if isinstance(last_candle.get("fvgs"), list) else [])
-    if pending and not pending.get("fvg"):
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "fvg_search_start",
-                trade_id=pending.get("trade_id"),
-                side=pending.get("side"),
-                bos_ts=pending.get("bos_ts"),
-                fvg_pool_size=len(fvg_source or []),
-            )
-        bos_dt = _parse_ts(pending.get("bos_ts"))
-        fvg = _select_first_post_bos_fvg(fvg_source or [], pending.get("side"), bos_dt)
-        if fvg:
-            fvg_score, trade_score, fvg_score_src, trade_score_src = _extract_fvg_score_fields(fvg)
-            pending["fvg"] = {
-                "created_ts": fvg.get("created_ts"),
-                "direction": fvg.get("direction"),
-                "low": _safe_float(fvg.get("low")),
-                "high": _safe_float(fvg.get("high")),
-                "filled": bool(fvg.get("filled", False)),
-                "filled_ts": fvg.get("filled_ts"),
-                "fvg_score": fvg_score,
-                "trade_score": trade_score,
-                "fvg_score_src": fvg_score_src,
-                "trade_score_src": trade_score_src,
-            }
-            print(
-                f"[BOS-FVG-DB-TP1] FVG selected | Symbol={symbol} | TF={timeframe} | TradeID={pending.get('trade_id')} | "
-                f"Side={pending.get('side')} | FVG_TS={fvg.get('created_ts')} | Low={_safe_float(fvg.get('low'))} | High={_safe_float(fvg.get('high'))} | "
-                f"FVGScore={fvg_score} | TradeScore={trade_score} | FVGScoreSrc={fvg_score_src} | TradeScoreSrc={trade_score_src} | "
-                f"FVG={json.dumps(fvg, default=str, sort_keys=True)}"
-            )
-            if execution_enabled and live_mode:
-                setup_id = _bridge_insert_rows(
-                    state=state,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    side=pending.get("side"),
-                    version=BRIDGE_VERSION,
-                    strategy_name="bos_fvg_ltf_tp1",
-                    bos_ts=pending.get("bos_ts"),
-                    fvg_high=_safe_float(fvg.get("high")),
-                    fvg_low=_safe_float(fvg.get("low")),
-                )
-                pending["setup_id"] = setup_id or _deterministic_setup_id(
-                    symbol,
-                    timeframe,
-                    pending.get("bos_ts"),
-                    BRIDGE_VERSION,
-                    pending.get("side"),
-                    _safe_float(fvg.get("high")),
-                    _safe_float(fvg.get("low")),
-                )
-                pending["notes"] = "fvg_selected_live_rows_created"
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "fvg_selected_and_rows_created",
-                        trade_id=pending.get("trade_id"),
-                        setup_id=pending.get("setup_id"),
-                        fvg_ts=pending["fvg"].get("created_ts"),
-                        fvg_low=pending["fvg"].get("low"),
-                        fvg_high=pending["fvg"].get("high"),
-                    )
-            else:
-                # Catch-up mode:
-                # keep the pending setup + selected FVG, but do NOT materialize
-                # Phase 1 rows yet. The first live candle can materialize later.
-                pending["setup_id"] = None
-                pending["notes"] = "fvg_selected_catchup_waiting_for_live_materialization"
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol,
-                        timeframe,
-                        "fvg_selected_catchup_no_rows_created",
-                        trade_id=pending.get("trade_id"),
-                        fvg_ts=pending["fvg"].get("created_ts"),
-                        fvg_low=pending["fvg"].get("low"),
-                        fvg_high=pending["fvg"].get("high"),
-                    )
-        elif DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "fvg_search_none",
-                trade_id=pending.get("trade_id"),
-                side=pending.get("side"),
-                bos_ts=pending.get("bos_ts"),
-                fvg_pool_size=len(fvg_source or []),
-            )
-    elif pending and pending.get("fvg"):
-        pending["fvg"], _ = _refresh_selected_fvg_fields(pending.get("fvg"), fvg_source or [])
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "fvg_refresh_existing",
-                trade_id=pending.get("trade_id"),
-                setup_id=pending.get("setup_id"),
-                fvg_ts=(pending.get("fvg") or {}).get("created_ts"),
-                fvg_filled=bool((pending.get("fvg") or {}).get("filled", False)),
-                trade_score=_safe_float((pending.get("fvg") or {}).get("trade_score")),
-            )
-
-    pending = state["pending_setup"]
-    pending_setup_rows = _bridge_setup_rows(state, (pending or {}).get("setup_id"))
-    if pending and pending.get("fvg"):
-        if pending_setup_rows and not all(bool(r.get("db_new_insert_confirmed")) for r in pending_setup_rows):
-            status = "pending_setup"
-            skip_reason = "awaiting_new_trades_insert_confirmation"
-            if DEBUG_LOGS:
-                _db_state_log(
-                    symbol,
-                    timeframe,
-                    "awaiting_new_trades_insert_confirmation",
-                    trade_id=pending.get("trade_id"),
-                    setup_id=pending.get("setup_id"),
-                    confirmed_rows=sum(1 for r in pending_setup_rows if bool(r.get("db_new_insert_confirmed"))),
-                    total_rows=len(pending_setup_rows),
-                )
-
-    bridge_setup_id = state.get("bridge_current_setup_id")
-    bridge_rows = _bridge_setup_rows(state, bridge_setup_id)
-    bridge_setup_meta = (state.get("bridge_setup_index") or {}).get(bridge_setup_id) or {}
-    managing_trade1 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and _safe_int(r.get("trade"), 0) == 1]
-    managing_trade2 = [r for r in bridge_rows if r.get("db_active_status") == "nt-managing" and _safe_int(r.get("trade"), 0) == 2]
-    if managing_trade1 or managing_trade2:
-        bridge_setup_meta["bridge_live_phase_entered"] = True
-    managing_rows_all = managing_trade1 + managing_trade2
-    avg_entry, avg_qty = _calc_avg_entry_from_rows(managing_rows_all)
-    if bridge_setup_id and avg_entry is not None and avg_qty > 0:
-        state["bridge_avg_entry"][bridge_setup_id] = avg_entry
-        state["bridge_avg_qty"][bridge_setup_id] = avg_qty
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "avg_entry_updated",
-                bridge_current_setup_id=bridge_setup_id,
-                avg_entry=avg_entry,
-                avg_qty=avg_qty,
-                managing_trade1=len(managing_trade1),
-                managing_trade2=len(managing_trade2),
-            )
-
-    # Phase 3 SL management
-    # Longs use swing lows; shorts use swing highs.
-    # Trade-bucket behavior:
-    #   - if trade1 managing:
-    #       longs  -> ts newer AND swing low  > max(BE, last_trade1_sl)
-    #                 trade1 rows -> swing low, trade2 rows -> BE
-    #       shorts -> ts newer AND swing high < min(BE, last_trade1_sl)
-    #                 trade1 rows -> swing high, trade2 rows -> BE
-    #   - if no trade1 managing but trade2 managing:
-    #       longs  -> ts only gate, trade2 rows -> swing low
-    #       shorts -> ts only gate, trade2 rows -> swing high
-    cp = bridge_rows[0].get("cp") if bridge_rows else None
-    if cp == "call":
-        be_price = state["bridge_avg_entry"].get(bridge_setup_id)
-        if managing_trade1:
-            swing_ts = recent_low_ts
-            swing_level = recent_low_price
-            swing_key = f"{bridge_setup_id}:swing_update_trade1"
-            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
-            prev_trade1_sl = None
-            for row in managing_trade1:
-                sl_val = _safe_float(row.get("sl_level"))
-                if sl_val is None:
-                    continue
-                prev_trade1_sl = sl_val if prev_trade1_sl is None else max(prev_trade1_sl, sl_val)
-            threshold = max(
-                _safe_float(be_price, float("-inf")) if be_price is not None else float("-inf"),
-                _safe_float(prev_trade1_sl, float("-inf")) if prev_trade1_sl is not None else float("-inf"),
-            )
-            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level > threshold:
-                state["bridge_last_swing_ts"][swing_key] = swing_ts
-                _bridge_update_rows(managing_trade1, {"sl_level": swing_level}, "swing_update_trade1")
-                if managing_trade2 and be_price is not None:
-                    _bridge_update_rows(managing_trade2, {"sl_level": be_price}, "be_update_trade2")
-        elif managing_trade2:
-            swing_ts = recent_low_ts
-            swing_level = recent_low_price
-            swing_key = f"{bridge_setup_id}:swing_update_trade2_only"
-            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
-            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
-                state["bridge_last_swing_ts"][swing_key] = swing_ts
-                _bridge_update_rows(managing_trade2, {"sl_level": swing_level}, "swing_update_trade2_only")
-    elif cp == "put":
-        be_price = state["bridge_avg_entry"].get(bridge_setup_id)
-        if managing_trade1:
-            swing_ts = recent_high_ts
-            swing_level = recent_high_price
-            swing_key = f"{bridge_setup_id}:swing_update_trade1"
-            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
-            prev_trade1_sl = None
-            for row in managing_trade1:
-                sl_val = _safe_float(row.get("sl_level"))
-                if sl_val is None:
-                    continue
-                prev_trade1_sl = sl_val if prev_trade1_sl is None else min(prev_trade1_sl, sl_val)
-            threshold = min(
-                _safe_float(be_price, float("inf")) if be_price is not None else float("inf"),
-                _safe_float(prev_trade1_sl, float("inf")) if prev_trade1_sl is not None else float("inf"),
-            )
-            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level < threshold:
-                state["bridge_last_swing_ts"][swing_key] = swing_ts
-                _bridge_update_rows(managing_trade1, {"sl_level": swing_level}, "swing_update_trade1")
-                if managing_trade2 and be_price is not None:
-                    _bridge_update_rows(managing_trade2, {"sl_level": be_price}, "be_update_trade2")
-        elif managing_trade2:
-            swing_ts = recent_high_ts
-            swing_level = recent_high_price
-            swing_key = f"{bridge_setup_id}:swing_update_trade2_only"
-            prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
-            if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
-                state["bridge_last_swing_ts"][swing_key] = swing_ts
-                _bridge_update_rows(managing_trade2, {"sl_level": swing_level}, "swing_update_trade2_only")
-    if bridge_rows:
-        has_managing = any(r.get("db_active_status") == "nt-managing" for r in bridge_rows)
-        has_active = any(bool(r.get("db_active_seen")) for r in bridge_rows)
-        live_phase_entered = bool(bridge_setup_meta.get("bridge_live_phase_entered"))
-        if DEBUG_LOGS:
-            _db_state_log(
-                symbol,
-                timeframe,
-                "bridge_current_setup_status",
-                bridge_current_setup_id=bridge_setup_id,
-                live_phase_entered=live_phase_entered,
-                **_bridge_counts(bridge_rows),
-            )
-        if live_phase_entered and not has_managing:
-            if not has_active:
-                if DEBUG_LOGS:
-                    _db_state_log(
-                        symbol, timeframe, "phase3_complete_no_rows_remaining",
-                        bridge_current_setup_id=bridge_setup_id
-                    )
-                bridge_setup_meta["bridge_live_phase_entered"] = False
-                if state.get("bridge_current_setup_id") == bridge_setup_id:
-                    state["bridge_current_setup_id"] = None
-                state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
-            else:
-                cancel_rows = [r for r in bridge_rows if r.get("db_active_status") == "nt-waiting"]
-                changed = _bridge_update_rows(cancel_rows, {"manage": "C"}, "phase3_no_live_rows")
-                if changed:
-                    _begin_manage_c_cleanup(
-                        state,
-                        setup_id=bridge_setup_id,
-                        source="phase3_no_live_rows",
-                        rows=cancel_rows,
-                        clear_pending_setup=False,
-                    )
-                    if DEBUG_LOGS:
-                        _db_state_log(symbol, timeframe, "phase3_cancel_request_sent", bridge_current_setup_id=bridge_setup_id, waiting_rows=len(cancel_rows))
-                elif not cancel_rows:
-                    if DEBUG_LOGS:
-                        _db_state_log(
-                            symbol, timeframe, "phase3_complete_no_rows_remaining",
-                            bridge_current_setup_id=bridge_setup_id
-                        )
-                    bridge_setup_meta["bridge_live_phase_entered"] = False
-                    if state.get("bridge_current_setup_id") == bridge_setup_id:
-                        state["bridge_current_setup_id"] = None
-                    state["bridge_eod_close_sent"].pop(bridge_setup_id, None)
-                else:
-                    bridge_setup_meta["bridge_live_phase_entered"] = True
-
-    if not cfg["enabled"]:
-        status = "disabled"
-        skip_reason = "bos_score_disabled"
-    elif any(r.get("db_active_status") == "nt-managing" for r in bridge_rows):
-        status = "live"
-    elif state.get("pending_setup"):
-        status = "pending_setup"
-    elif state.get("bridge_current_setup_id") and bool(bridge_setup_meta.get("bridge_live_phase_entered")):
-        status = "live"
-
-    if DEBUG_LOGS:
-        _db_state_log(
-            symbol,
-            timeframe,
-            "eval_end",
-            status=status,
-            skip_reason=skip_reason,
-            **_pending_summary(state.get("pending_setup")),
-            **_rearm_summary(state.get("pending_rearm_setup")),
-            **_deferred_bos_summary(state.get("deferred_bos")),
-            bridge_current_setup_id=state.get("bridge_current_setup_id"),
+        payloads = _new_trade_payloads(rows)
+        _direct_state_log("phase1_insert_attempt", state, rows=len(payloads))
+        insert_result = db_insert_raw(
+            table="new_trades",
+            payload=payloads,
+            log_label=state["strategy"],
         )
+        if insert_result.get("success"):
+            state["phase"] = "phase2_waiting"
+            _direct_state_log("phase1_insert_success", state, attempts=insert_result.get("attempts"))
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase2_waiting")
+
+        _direct_state_log("phase1_insert_failed", state, error=insert_result.get("error"))
+        return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase1_insert_failed")
+
+    if state.get("phase") == "phase2_waiting":
+        if candidate_bos is not None:
+            state["new_bos_info"] = deepcopy(candidate_bos)
+            _direct_state_log("phase2_new_bos_detected", state, bos_ts=candidate_bos.get("bos_ts"))
+
+        active = active_trades_checker(
+            strategy=state["strategy"],
+            version=state["version"],
+            setup_id=state["setup_id"],
+            log_label=state["strategy"],
+        )
+        if not active.get("success"):
+            _direct_state_log("phase2_db_error", state, error=active.get("error"))
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase2_db_error")
+
+        if active.get("managing_present"):
+            state["phase"] = "phase3_live"
+            state["new_bos_info"] = None
+            _direct_state_log("phase2_to_phase3", state, managing_qty=active.get("managing_qty"))
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="live", skip_reason="")
+
+        if state.get("new_bos_info"):
+            _direct_state_log("phase2_cleanup_attempt", state)
+            cleanup = active_cleanup(
+                strategy=state["strategy"],
+                version=state["version"],
+                setup_id=state["setup_id"],
+                log_label=state["strategy"],
+            )
+            if cleanup.get("success"):
+                state["bos_info"] = deepcopy(state["new_bos_info"])
+                state["side"] = state["bos_info"].get("side")
+                state["swing_info"] = {
+                    "entry_ref_swing_high": state["bos_info"].get("entry_ref_swing_high"),
+                    "entry_ref_swing_high_ts": state["bos_info"].get("entry_ref_swing_high_ts"),
+                    "entry_ref_swing_low": state["bos_info"].get("entry_ref_swing_low"),
+                    "entry_ref_swing_low_ts": state["bos_info"].get("entry_ref_swing_low_ts"),
+                }
+                state["fvg_info"] = None
+                state["setup_id"] = None
+                state["new_bos_info"] = None
+                state["phase"] = "phase1_setup"
+                state["bridge_current_setup_id"] = None
+                _direct_state_log("phase2_cleanup_success", state)
+                return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="cleanup_restart")
+
+            _direct_state_log("phase2_cleanup_failed", state, error=cleanup.get("error"))
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="cleanup_failed")
+
+        return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="pending_setup", skip_reason="phase2_waiting")
+
+    if state.get("phase") == "phase3_live":
+        active = active_trades_checker(
+            strategy=state["strategy"],
+            version=state["version"],
+            setup_id=state["setup_id"],
+            log_label=state["strategy"],
+        )
+        if not active.get("success"):
+            _direct_state_log("phase3_db_error", state, error=active.get("error"))
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="live", skip_reason="phase3_db_error")
+
+        bridge_rows = _bridge_setup_rows(state, state.get("setup_id"))
+        managing_trade1 = _bridge_rows_from_active(state, state.get("setup_id"), active.get("data") or [], trade_number=1)
+        managing_trade2 = _bridge_rows_from_active(state, state.get("setup_id"), active.get("data") or [], trade_number=2)
+        avg_entry, avg_qty = _calc_avg_entry_from_rows(managing_trade1 + managing_trade2)
+        if state.get("setup_id") and avg_entry is not None and avg_qty > 0:
+            state["bridge_avg_entry"][state["setup_id"]] = avg_entry
+            state["bridge_avg_qty"][state["setup_id"]] = avg_qty
+
+        if active.get("managing_present"):
+            cp = bridge_rows[0].get("cp") if bridge_rows else None
+            be_price = state["bridge_avg_entry"].get(state.get("setup_id"))
+            if cp == "call":
+                if managing_trade1:
+                    swing_ts = recent_low_ts
+                    swing_level = recent_low_price
+                    swing_key = f"{state.get('setup_id')}:swing_update_trade1"
+                    prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+                    prev_trade1_sl = None
+                    for row in managing_trade1:
+                        sl_val = _safe_float(row.get("sl_level"))
+                        if sl_val is None:
+                            continue
+                        prev_trade1_sl = sl_val if prev_trade1_sl is None else max(prev_trade1_sl, sl_val)
+                    threshold = max(
+                        _safe_float(be_price, float("-inf")) if be_price is not None else float("-inf"),
+                        _safe_float(prev_trade1_sl, float("-inf")) if prev_trade1_sl is not None else float("-inf"),
+                    )
+                    if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level > threshold:
+                        state["bridge_last_swing_ts"][swing_key] = swing_ts
+                        _patch_sl_rows(state, managing_trade1, swing_level, "swing_update_trade1")
+                        if managing_trade2 and be_price is not None:
+                            _patch_sl_rows(state, managing_trade2, be_price, "be_update_trade2")
+                elif managing_trade2:
+                    swing_ts = recent_low_ts
+                    swing_level = recent_low_price
+                    swing_key = f"{state.get('setup_id')}:swing_update_trade2_only"
+                    prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+                    if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
+                        state["bridge_last_swing_ts"][swing_key] = swing_ts
+                        _patch_sl_rows(state, managing_trade2, swing_level, "swing_update_trade2_only")
+            elif cp == "put":
+                if managing_trade1:
+                    swing_ts = recent_high_ts
+                    swing_level = recent_high_price
+                    swing_key = f"{state.get('setup_id')}:swing_update_trade1"
+                    prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+                    prev_trade1_sl = None
+                    for row in managing_trade1:
+                        sl_val = _safe_float(row.get("sl_level"))
+                        if sl_val is None:
+                            continue
+                        prev_trade1_sl = sl_val if prev_trade1_sl is None else min(prev_trade1_sl, sl_val)
+                    threshold = min(
+                        _safe_float(be_price, float("inf")) if be_price is not None else float("inf"),
+                        _safe_float(prev_trade1_sl, float("inf")) if prev_trade1_sl is not None else float("inf"),
+                    )
+                    if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts) and swing_level < threshold:
+                        state["bridge_last_swing_ts"][swing_key] = swing_ts
+                        _patch_sl_rows(state, managing_trade1, swing_level, "swing_update_trade1")
+                        if managing_trade2 and be_price is not None:
+                            _patch_sl_rows(state, managing_trade2, be_price, "be_update_trade2")
+                elif managing_trade2:
+                    swing_ts = recent_high_ts
+                    swing_level = recent_high_price
+                    swing_key = f"{state.get('setup_id')}:swing_update_trade2_only"
+                    prev_swing_ts = state["bridge_last_swing_ts"].get(swing_key)
+                    if swing_ts and swing_level is not None and (prev_swing_ts is None or swing_ts > prev_swing_ts):
+                        state["bridge_last_swing_ts"][swing_key] = swing_ts
+                        _patch_sl_rows(state, managing_trade2, swing_level, "swing_update_trade2_only")
+
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="live", skip_reason="")
+
+        if active.get("waiting_present"):
+            cleanup = active_cleanup(
+                strategy=state["strategy"],
+                version=state["version"],
+                setup_id=state["setup_id"],
+                log_label=state["strategy"],
+            )
+            if cleanup.get("success"):
+                _clear_direct_setup(state)
+                return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="idle", skip_reason="phase3_cleanup_done")
+            return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="live", skip_reason="phase3_cleanup_failed")
+
+        _clear_direct_setup(state)
+        return _direct_snapshot(state, last_ts=last_ts, last_ts_et=last_ts_et, status="idle", skip_reason="phase3_complete")
 
     state["signal_id_counter"] += 1
     signal = {
