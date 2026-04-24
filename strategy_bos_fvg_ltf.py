@@ -719,6 +719,7 @@ def _direct_state_log(stage: str, state: Dict[str, Any], **extra: Any) -> None:
         f"setup_id={state.get('setup_id')}",
         f"side={state.get('side')}",
         f"bos={state.get('bos_info') is not None}",
+        f"bos_ts={(state.get('bos_info') or {}).get('bos_ts')}",
         f"fvg={state.get('fvg_info') is not None}",
         f"new_bos={state.get('new_bos_info') is not None}",
         f"latest_bull_fvg_ts={state.get('latest_bull_fvg_ts')}",
