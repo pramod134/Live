@@ -17,6 +17,7 @@ from indicator_calc2 import compute_advanced_extras
 from post_indicator import compute_post_indicators
 
 from strategies import evaluate_strategies
+from skinny_snapshot_builder import build_gpt_strategy_input
 
 from liquidity_pool_builder import build_liquidity_pool
 
@@ -1730,31 +1731,6 @@ class IndicatorBot:
                 structure_state = snapshot["structure_state"]
                 extras_advanced = pack["extras_advanced"]
     
-                cluster = last_candle.get("cluster") or {}
-
-                t0 = time.perf_counter()
-                strategies = evaluate_strategies(
-                    symbol=sym_upper,
-                    timeframe=tf,
-                    candles=pack["closed_candles"],
-                    swings=swings,
-                    fvgs=fvgs,
-                    liquidity=liquidity,
-                    trend=trend,
-                    cluster=cluster,
-                    volume_profile=volume_profile,
-                    htf_swings=None,
-                    structure_states_by_tf={
-                        k: (v or {}).get("structure_state")
-                        for k, v in (snap_map or {}).items()
-                        if isinstance(v, dict)
-                    },
-                    run_strategy=runtime_cfg.get("run_strategy"),
-                    selected_strategy=runtime_cfg.get("selected_strategy"),
-                    spot_last_candle=spot_last_candle,
-                )
-                self._record_perf("strategy_eval", time.perf_counter() - t0, tf=tf)
-
                 # ---------------- EVENTS (NEW) ----------------
                 prev_state = self.last_events_state.get(sym_upper, {}).get(tf) or {}
                 prev_latest = prev_state.get("events_latest")
@@ -1819,6 +1795,47 @@ class IndicatorBot:
                 ev_out = compute_spot_events(ev_ctx)
                 self._record_perf("spot_event", time.perf_counter() - t0, tf=tf)
                 self._spot_event_calls_by_tf[tf] = self._spot_event_calls_by_tf.get(tf, 0) + 1
+
+                current_events_by_tf = dict(self.last_events_state.get(sym_upper, {}) or {})
+                current_events_by_tf[tf] = {
+                    "events_latest": ev_out["events_latest"],
+                    "events_active": ev_out["events_active"],
+                    "events_recent": ev_out["events_recent"],
+                }
+
+                cluster = last_candle.get("cluster") or {}
+                strategy_context = build_gpt_strategy_input(
+                    symbol=sym_upper,
+                    snapshots_by_tf=snap_map,
+                    spot_events_by_tf=current_events_by_tf,
+                    active_setups=[],
+                    live_price=None,
+                    live_ts=None,
+                )
+
+                t0 = time.perf_counter()
+                strategies = evaluate_strategies(
+                    symbol=sym_upper,
+                    timeframe=tf,
+                    candles=pack["closed_candles"],
+                    swings=swings,
+                    fvgs=fvgs,
+                    liquidity=liquidity,
+                    trend=trend,
+                    cluster=cluster,
+                    volume_profile=volume_profile,
+                    htf_swings=None,
+                    structure_states_by_tf={
+                        k: (v or {}).get("structure_state")
+                        for k, v in (snap_map or {}).items()
+                        if isinstance(v, dict)
+                    },
+                    run_strategy=runtime_cfg.get("run_strategy"),
+                    selected_strategy=runtime_cfg.get("selected_strategy"),
+                    spot_last_candle=spot_last_candle,
+                    strategy_context=strategy_context,
+                )
+                self._record_perf("strategy_eval", time.perf_counter() - t0, tf=tf)
 
                 # Attach extras_advanced + strategies to snapshot so cached "row shape"
                 # is what zone/liquidity builders expect (no DB writes).

@@ -470,6 +470,7 @@ def evaluate_strategies(
     spot_last_candle: Optional[Dict[str, Any]] = None,
     run_strategy: Optional[bool] = None,
     selected_strategy: Optional[str] = None,
+    strategy_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Evaluate enabled strategies for this symbol/timeframe.
