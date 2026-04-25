@@ -339,30 +339,30 @@ async def upsert_spot_events_row(
         "events_active": events_active,
         "events_recent": events_recent,
     }
-    try:
-        logger.info(
-            "[EVENTS][DB][DEBUG] upsert payload symbol=%s timeframe=%s payload=%s",
-            symbol.upper(),
-            timeframe,
-            json.dumps(payload, default=str),
-        )
-    except Exception:
-        logger.info(
-            "[EVENTS][DB][DEBUG] upsert payload symbol=%s timeframe=%s payload_unserializable=%r",
-            symbol.upper(),
-            timeframe,
-            payload,
-        )
+    # try:
+    #     logger.info(
+    #         "[EVENTS][DB][DEBUG] upsert payload symbol=%s timeframe=%s payload=%s",
+    #         symbol.upper(),
+    #         timeframe,
+    #         json.dumps(payload, default=str),
+    #     )
+    # except Exception:
+    #     logger.info(
+    #         "[EVENTS][DB][DEBUG] upsert payload symbol=%s timeframe=%s payload_unserializable=%r",
+    #         symbol.upper(),
+    #         timeframe,
+    #         payload,
+    #     )
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(endpoint, json=payload, headers=headers)
-        logger.info(
-            "[EVENTS][DB][DEBUG] upsert response symbol=%s timeframe=%s status=%s body=%s",
-            symbol.upper(),
-            timeframe,
-            resp.status_code,
-            resp.text,
-        )
+        # logger.info(
+        #     "[EVENTS][DB][DEBUG] upsert response symbol=%s timeframe=%s status=%s body=%s",
+        #     symbol.upper(),
+        #     timeframe,
+        #     resp.status_code,
+        #     resp.text,
+        # )
         if resp.status_code >= 400:
             # print(f"[EVENTS][DB] Upsert failed for {symbol} {timeframe} (status={resp.status_code})")
             # print(f"[EVENTS][DB] Response text: {resp.text}")
