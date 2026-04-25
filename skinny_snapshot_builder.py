@@ -9,6 +9,8 @@ import datetime as dt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_INCLUDE_TFS = ["1d", "1h", "15m", "5m", "1m"]
+FVG_FRESH_BARS = 12
+FVG_STALE_BARS = 50
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -64,6 +66,52 @@ def _seconds_between(a_iso: Optional[str], b_iso: Optional[str]) -> Optional[int
     if not a or not b:
         return None
     return int(abs((a - b).total_seconds()))
+
+
+def _tf_to_seconds(tf: Any) -> Optional[int]:
+    s = str(tf or "").strip().lower()
+    if not s:
+        return None
+    try:
+        if s.endswith("m"):
+            return int(s[:-1]) * 60
+        if s.endswith("h"):
+            return int(s[:-1]) * 60 * 60
+        if s.endswith("d"):
+            return int(s[:-1]) * 24 * 60 * 60
+        if s.endswith("w"):
+            return int(s[:-1]) * 7 * 24 * 60 * 60
+        if s.isdigit():
+            return int(s) * 60
+    except Exception:
+        return None
+    return None
+
+
+def _atr_buffers(atr: Optional[float]) -> Dict[str, Optional[float]]:
+    a = _safe_float(atr)
+    if a is None or a <= 0:
+        return {"tight": None, "normal": None, "wide": None}
+    return {
+        "tight": _round(a * 0.10),
+        "normal": _round(a * 0.25),
+        "wide": _round(a * 0.40),
+    }
+
+
+def _level_with_buffers(price: Any, atr: Optional[float]) -> Dict[str, Any]:
+    p = _safe_float(price)
+    buffers = _atr_buffers(atr)
+    out: Dict[str, Any] = {
+        "price": _round(p),
+        "atr_buffer": buffers,
+    }
+    if p is not None:
+        normal = _safe_float(buffers.get("normal"))
+        if normal is not None:
+            out["long_stop_ref"] = _round(p - normal)
+            out["short_stop_ref"] = _round(p + normal)
+    return out
 
 
 def _direction_from_state(state: Any) -> str:
@@ -223,11 +271,13 @@ def _extract_vwap(snapshot: Dict[str, Any], decision_price: Optional[float]) -> 
     }
 
 
-def _compact_level(level: Any) -> Optional[Dict[str, Any]]:
+def _compact_level(level: Any, atr: Optional[float] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(level, dict):
         return None
+    price = level.get("price") or level.get("level")
+    level_info = _level_with_buffers(price, atr)
     return {
-        "price": _round(level.get("price") or level.get("level")),
+        **level_info,
         "state": level.get("state"),
         "type": level.get("type") or level.get("kind"),
         "ts": level.get("ts") or level.get("ts_ref"),
@@ -237,33 +287,34 @@ def _compact_level(level: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _extract_liquidity(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_liquidity(snapshot: Dict[str, Any], atr: Optional[float] = None) -> Dict[str, Any]:
     liq = _dict(_dict(snapshot.get("extras_advanced")).get("liq_summary"))
     liq_lite = _dict(snapshot.get("liquidity_lite"))
     return {
         "eq_highs": _safe_int(liq.get("eq_high_stack_count")),
         "eq_lows": _safe_int(liq.get("eq_low_stack_count")),
-        "nearest_clean_high": _round(liq.get("nearest_clean_high_price")),
-        "nearest_clean_low": _round(liq.get("nearest_clean_low_price")),
+        "nearest_clean_high": _level_with_buffers(liq.get("nearest_clean_high_price"), atr),
+        "nearest_clean_low": _level_with_buffers(liq.get("nearest_clean_low_price"), atr),
         "nearest_clean_high_dist_pct": _round(liq.get("nearest_clean_high_dist_pct"), 5),
         "nearest_clean_low_dist_pct": _round(liq.get("nearest_clean_low_dist_pct"), 5),
-        "nearest_intact_above": _compact_level(liq_lite.get("nearest_intact_above")),
-        "nearest_intact_below": _compact_level(liq_lite.get("nearest_intact_below")),
-        "nearest_swept_above": _compact_level(liq_lite.get("nearest_swept_above")),
-        "nearest_swept_below": _compact_level(liq_lite.get("nearest_swept_below")),
+        "nearest_intact_above": _compact_level(liq_lite.get("nearest_intact_above"), atr),
+        "nearest_intact_below": _compact_level(liq_lite.get("nearest_intact_below"), atr),
+        "nearest_swept_above": _compact_level(liq_lite.get("nearest_swept_above"), atr),
+        "nearest_swept_below": _compact_level(liq_lite.get("nearest_swept_below"), atr),
     }
 
 
-def _extract_structural_levels(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_structural_levels(snapshot: Dict[str, Any], atr: Optional[float] = None) -> Dict[str, Any]:
     s = _dict(snapshot.get("structural_lite"))
 
     def point(p: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(p, dict):
             return None
         swing = _dict(p.get("swing"))
+        level_info = _level_with_buffers(p.get("price"), atr)
         return {
             "label": p.get("label"),
-            "price": _round(p.get("price")),
+            **level_info,
             "state": swing.get("state"),
             "ts": p.get("ts"),
         }
@@ -278,14 +329,44 @@ def _extract_structural_levels(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _compact_fvg(f: Any) -> Optional[Dict[str, Any]]:
+def _fvg_freshness(created_ts: Any, asof_ts: Any, tf: str) -> Dict[str, Any]:
+    age_sec = _seconds_between(asof_ts, created_ts) if created_ts else None
+    tf_sec = _tf_to_seconds(tf)
+    age_bars = None
+    if age_sec is not None and tf_sec and tf_sec > 0:
+        age_bars = int(age_sec // tf_sec)
+
+    if age_bars is None:
+        freshness = "unknown"
+        age_weight = None
+    elif age_bars <= FVG_FRESH_BARS:
+        freshness = "fresh"
+        age_weight = 1.0
+    elif age_bars <= FVG_STALE_BARS:
+        freshness = "valid"
+        age_weight = max(0.35, 1.0 - ((age_bars - FVG_FRESH_BARS) / max(1, FVG_STALE_BARS - FVG_FRESH_BARS)) * 0.65)
+    else:
+        freshness = "stale"
+        age_weight = 0.25
+
+    return {
+        "age_sec": age_sec,
+        "age_bars": age_bars,
+        "freshness": freshness,
+        "age_weight": _round(age_weight, 3),
+    }
+
+
+def _compact_fvg(f: Any, *, tf: str, asof_ts: Any, atr: Optional[float] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(f, dict):
         return None
     style = _dict(f.get("style"))
+    low = _safe_float(f.get("low"))
+    high = _safe_float(f.get("high"))
     return {
         "direction": f.get("direction"),
-        "low": _round(f.get("low")),
-        "high": _round(f.get("high")),
+        "low": _level_with_buffers(low, atr),
+        "high": _level_with_buffers(high, atr),
         "trade_score": _round(f.get("trade_score"), 1),
         "fvg_score": _round(f.get("fvg_score"), 1),
         "touch_count": f.get("touch_count"),
@@ -296,25 +377,33 @@ def _compact_fvg(f: Any) -> Optional[Dict[str, Any]]:
         "created_ts": f.get("created_ts"),
         "first_touch_ts": f.get("first_touch_ts"),
         "filled_ts": f.get("filled_ts"),
+        "freshness": _fvg_freshness(f.get("created_ts"), asof_ts, tf),
     }
 
 
-def _extract_top_fvgs(snapshot: Dict[str, Any], limit_each_side: int = 2) -> Dict[str, Any]:
+def _extract_top_fvgs(
+    snapshot: Dict[str, Any],
+    *,
+    tf: str,
+    asof_ts: Any,
+    atr: Optional[float] = None,
+    limit_each_side: int = 2,
+) -> Dict[str, Any]:
     f = _dict(snapshot.get("fvgs_lite"))
-    bull_below = [_compact_fvg(x) for x in _list(f.get("bearish_below"))[:limit_each_side]]
-    bear_above = [_compact_fvg(x) for x in _list(f.get("bullish_above"))[:limit_each_side]]
+    bull_below = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bearish_below"))[:limit_each_side]]
+    bear_above = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bullish_above"))[:limit_each_side]]
     return {
         "bullish_below": [x for x in bull_below if x],
         "bearish_above": [x for x in bear_above if x],
     }
 
 
-def _compact_vp_node(node: Any) -> Optional[Dict[str, Any]]:
+def _compact_vp_node(node: Any, atr: Optional[float] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(node, dict):
         return None
     return {
         "low": _round(node.get("low")),
-        "poc": _round(node.get("poc")),
+        "poc": _level_with_buffers(node.get("poc"), atr),
         "high": _round(node.get("high")),
         "rank": node.get("rank"),
         "final_score": _round(node.get("final_score"), 1),
@@ -322,7 +411,11 @@ def _compact_vp_node(node: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _extract_vp(snapshot: Dict[str, Any], profile_names: Iterable[str] = ("session", "daily_extremes", "structural")) -> Dict[str, Any]:
+def _extract_vp(
+    snapshot: Dict[str, Any],
+    atr: Optional[float] = None,
+    profile_names: Iterable[str] = ("session", "daily_extremes", "structural"),
+) -> Dict[str, Any]:
     profiles = _dict(_dict(snapshot.get("volume_profile_lite")).get("profiles"))
     out: Dict[str, Any] = {}
     for name in profile_names:
@@ -330,13 +423,13 @@ def _extract_vp(snapshot: Dict[str, Any], profile_names: Iterable[str] = ("sessi
         if not p:
             continue
         out[name] = {
-            "poc": _round(p.get("poc")),
-            "poc2": _round(p.get("poc2")),
-            "hvn_here": _compact_vp_node(p.get("nearest_hvn_containing_price")),
-            "hvn_above": _compact_vp_node(p.get("nearest_hvn_above")),
-            "hvn_below": _compact_vp_node(p.get("nearest_hvn_below")),
-            "lvn_above": _compact_vp_node(p.get("nearest_lvn_above")),
-            "lvn_below": _compact_vp_node(p.get("nearest_lvn_below")),
+            "poc": _level_with_buffers(p.get("poc"), atr),
+            "poc2": _level_with_buffers(p.get("poc2"), atr),
+            "hvn_here": _compact_vp_node(p.get("nearest_hvn_containing_price"), atr),
+            "hvn_above": _compact_vp_node(p.get("nearest_hvn_above"), atr),
+            "hvn_below": _compact_vp_node(p.get("nearest_hvn_below"), atr),
+            "lvn_above": _compact_vp_node(p.get("nearest_lvn_above"), atr),
+            "lvn_below": _compact_vp_node(p.get("nearest_lvn_below"), atr),
         }
     return out
 
@@ -456,10 +549,11 @@ def build_tf_skinny_snapshot(
         "momentum": momentum,
         "vwap": _extract_vwap(snapshot, dp),
         "vol_context": _extract_vol_context(snapshot),
-        "liquidity": _extract_liquidity(snapshot),
-        "structural_levels": _extract_structural_levels(snapshot),
-        "fvgs": _extract_top_fvgs(snapshot),
-        "volume_profile": _extract_vp(snapshot),
+        "atr_buffers": _atr_buffers(atr),
+        "liquidity": _extract_liquidity(snapshot, atr),
+        "structural_levels": _extract_structural_levels(snapshot, atr),
+        "fvgs": _extract_top_fvgs(snapshot, tf=tf, asof_ts=snapshot.get("asof") or last.get("ts"), atr=atr),
+        "volume_profile": _extract_vp(snapshot, atr),
         "events": {
             "latest": _extract_latest_events(event_state),
             "active_trackers": _extract_active_trackers(event_state),
@@ -501,7 +595,60 @@ def build_snapshot_summary(tfs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
     total = bull + bear
     confidence = round((max(bull, bear) / total) * 100, 1) if total > 0 else 0.0
-    return {"bias": bias, "bull_score": round(bull, 2), "bear_score": round(bear, 2), "confidence": confidence, "notes": notes}
+    return {
+        "bias": bias,
+        "bull_score": round(bull, 2),
+        "bear_score": round(bear, 2),
+        "confidence": confidence,
+        "notes": notes,
+        "mtf_alignment": build_mtf_alignment(tfs),
+    }
+
+
+def build_mtf_alignment(tfs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    weights = {"1w": 6, "1d": 5, "1h": 4, "15m": 3, "5m": 2, "3m": 1.5, "1m": 1}
+    bull = 0.0
+    bear = 0.0
+    neutral = 0.0
+    aligned_tfs: List[str] = []
+    conflict_tfs: List[str] = []
+
+    directions: Dict[str, str] = {}
+    for tf, block in tfs.items():
+        direction = _dict(block.get("structure")).get("direction") or "neutral"
+        directions[tf] = direction
+        w = weights.get(tf, 1.0)
+        if direction == "bullish":
+            bull += w
+        elif direction == "bearish":
+            bear += w
+        else:
+            neutral += w
+
+    if bull > bear and bull > neutral:
+        dominant = "bullish"
+    elif bear > bull and bear > neutral:
+        dominant = "bearish"
+    else:
+        dominant = "mixed"
+
+    total = bull + bear + neutral
+    dominant_score = bull if dominant == "bullish" else bear if dominant == "bearish" else neutral
+    score = round(dominant_score / total, 3) if total > 0 else 0.0
+
+    for tf, direction in directions.items():
+        if dominant in ("bullish", "bearish") and direction == dominant:
+            aligned_tfs.append(tf)
+        elif direction in ("bullish", "bearish") and dominant in ("bullish", "bearish") and direction != dominant:
+            conflict_tfs.append(tf)
+
+    return {
+        "direction": dominant,
+        "score": score,
+        "aligned_tfs": aligned_tfs,
+        "conflict_tfs": conflict_tfs,
+        "directions_by_tf": directions,
+    }
 
 
 def build_gpt_skinny_snapshot(
