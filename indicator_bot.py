@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+
 from candle_engine import CandleEngine, SUPPORTED_TFS
 
 from indicator_calc1 import compute_all_indicators
