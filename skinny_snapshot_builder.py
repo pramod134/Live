@@ -8,7 +8,10 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-DEFAULT_INCLUDE_TFS = ["1d", "1h", "15m", "5m", "1m"]
+DEFAULT_INCLUDE_TFS = ["1d", "1h", "15m", "5m", "3m", "1m"]
+DEFAULT_DECISION_PRICE_FALLBACK_TFS = ["1m", "3m", "5m"]
+DEFAULT_VP_PROFILES = ("structural", "session", "rolling_60")
+MACRO_WEEKLY_TF = "1w"
 FVG_FRESH_BARS = 12
 FVG_STALE_BARS = 50
 
@@ -66,6 +69,14 @@ def _seconds_between(a_iso: Optional[str], b_iso: Optional[str]) -> Optional[int
     if not a or not b:
         return None
     return int(abs((a - b).total_seconds()))
+
+
+def _signed_seconds_between(later_iso: Optional[str], earlier_iso: Optional[str]) -> Optional[int]:
+    later = _iso_to_dt(later_iso)
+    earlier = _iso_to_dt(earlier_iso)
+    if not later or not earlier:
+        return None
+    return int((later - earlier).total_seconds())
 
 
 def _tf_to_seconds(tf: Any) -> Optional[int]:
@@ -139,10 +150,17 @@ def _event_truthy(v: Any) -> bool:
 # Decision price
 # ---------------------------------------------------------------------------
 
-def _get_1m_close(snapshots_by_tf: Dict[str, Dict[str, Any]]) -> Tuple[Optional[float], Optional[str]]:
-    snap_1m = _dict(snapshots_by_tf.get("1m"))
-    candle = _dict(snap_1m.get("last_candle"))
-    return _safe_float(candle.get("close")), candle.get("ts")
+def _get_fallback_close(
+    snapshots_by_tf: Dict[str, Dict[str, Any]],
+    fallback_tfs: Optional[List[str]] = None,
+) -> Tuple[Optional[float], Optional[str], str]:
+    for tf in fallback_tfs or DEFAULT_DECISION_PRICE_FALLBACK_TFS:
+        snap = _dict(snapshots_by_tf.get(tf))
+        candle = _dict(snap.get("last_candle"))
+        close = _safe_float(candle.get("close"))
+        if close is not None:
+            return close, candle.get("ts"), f"{tf}_close"
+    return None, None, "unavailable"
 
 
 def build_decision_price(
@@ -163,13 +181,43 @@ def build_decision_price(
             "staleness_sec": _seconds_between(decision_ts, live_ts or decision_ts),
         }
 
-    close_1m, ts_1m = _get_1m_close(snapshots_by_tf)
+    fallback_close, fallback_ts, fallback_source = _get_fallback_close(snapshots_by_tf)
     return {
-        "price": _round(close_1m),
-        "source": "1m_close" if close_1m is not None else "unavailable",
-        "ts": ts_1m,
+        "price": _round(fallback_close),
+        "source": fallback_source,
+        "ts": fallback_ts,
         "decision_ts": decision_ts,
-        "staleness_sec": _seconds_between(decision_ts, ts_1m),
+        "staleness_sec": _seconds_between(decision_ts, fallback_ts),
+    }
+
+
+def build_market_context(decision_ts: Optional[str]) -> Dict[str, Any]:
+    t = _iso_to_dt(decision_ts)
+    if not t:
+        return {
+            "weekday": None,
+            "session": "unknown",
+            "near_open": False,
+            "near_close": False,
+        }
+
+    et = t.astimezone(dt.timezone(dt.timedelta(hours=-4)))
+    mins = et.hour * 60 + et.minute
+    rth_open = 9 * 60 + 30
+    rth_close = 16 * 60
+
+    if mins < rth_open:
+        session = "premarket"
+    elif mins <= rth_close:
+        session = "rth"
+    else:
+        session = "after_hours"
+
+    return {
+        "weekday": et.strftime("%A"),
+        "session": session,
+        "near_open": session == "rth" and mins <= rth_open + 30,
+        "near_close": session == "rth" and mins >= rth_close - 30,
     }
 
 
@@ -209,10 +257,18 @@ def _extract_structure(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     ea = _dict(snapshot.get("extras_advanced"))
     meta = _dict(snapshot.get("structure_meta") or ea.get("structure_meta"))
     state = snapshot.get("structure_state") or ea.get("structure_state")
+    direction = meta.get("direction") or _direction_from_state(state)
+    trend_state = _dict(snapshot.get("trend")).get("state")
+    trend_direction = "bullish" if trend_state == "bull" else "bearish" if trend_state == "bear" else "neutral"
+    agreement = (
+        direction in ("bullish", "bearish")
+        and trend_direction in ("bullish", "bearish")
+        and direction == trend_direction
+    )
     return {
         "state": state,
         "raw": snapshot.get("structure_state_raw") or meta.get("raw_state"),
-        "direction": meta.get("direction") or _direction_from_state(state),
+        "direction": direction,
         "action": meta.get("action"),
         "confidence": meta.get("confidence"),
         "risk_tier": meta.get("risk_tier"),
@@ -220,6 +276,8 @@ def _extract_structure(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "momentum_exhaustion": meta.get("momentum_exhaustion"),
         "htf_alignment": meta.get("htf_alignment"),
         "vwap_context": meta.get("vwap_context"),
+        "trend_direction": trend_direction,
+        "structure_trend_agreement": agreement,
     }
 
 
@@ -330,13 +388,16 @@ def _extract_structural_levels(snapshot: Dict[str, Any], atr: Optional[float] = 
 
 
 def _fvg_freshness(created_ts: Any, asof_ts: Any, tf: str) -> Dict[str, Any]:
-    age_sec = _seconds_between(asof_ts, created_ts) if created_ts else None
+    age_sec = _signed_seconds_between(asof_ts, created_ts) if created_ts else None
     tf_sec = _tf_to_seconds(tf)
     age_bars = None
-    if age_sec is not None and tf_sec and tf_sec > 0:
+    if age_sec is not None and age_sec >= 0 and tf_sec and tf_sec > 0:
         age_bars = int(age_sec // tf_sec)
 
-    if age_bars is None:
+    if age_sec is not None and age_sec < 0:
+        freshness = "invalid_future"
+        age_weight = 0.0
+    elif age_bars is None:
         freshness = "unknown"
         age_weight = None
     elif age_bars <= FVG_FRESH_BARS:
@@ -390,11 +451,11 @@ def _extract_top_fvgs(
     limit_each_side: int = 2,
 ) -> Dict[str, Any]:
     f = _dict(snapshot.get("fvgs_lite"))
-    bull_below = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bearish_below"))[:limit_each_side]]
-    bear_above = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bullish_above"))[:limit_each_side]]
+    below_items = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bearish_below"))[:limit_each_side]]
+    above_items = [_compact_fvg(x, tf=tf, asof_ts=asof_ts, atr=atr) for x in _list(f.get("bullish_above"))[:limit_each_side]]
     return {
-        "bullish_below": [x for x in bull_below if x],
-        "bearish_above": [x for x in bear_above if x],
+        "bullish_below": [x for x in below_items if x],
+        "bearish_above": [x for x in above_items if x],
     }
 
 
@@ -414,7 +475,7 @@ def _compact_vp_node(node: Any, atr: Optional[float] = None) -> Optional[Dict[st
 def _extract_vp(
     snapshot: Dict[str, Any],
     atr: Optional[float] = None,
-    profile_names: Iterable[str] = ("session", "daily_extremes", "structural"),
+    profile_names: Iterable[str] = DEFAULT_VP_PROFILES,
 ) -> Dict[str, Any]:
     profiles = _dict(_dict(snapshot.get("volume_profile_lite")).get("profiles"))
     out: Dict[str, Any] = {}
@@ -523,6 +584,8 @@ def build_tf_skinny_snapshot(
     snapshot: Dict[str, Any],
     event_state: Optional[Dict[str, Any]] = None,
     decision_price: Optional[float] = None,
+    decision_ts: Optional[str] = None,
+    fvg_limit_each_side: int = 2,
 ) -> Dict[str, Any]:
     snapshot = _dict(snapshot)
     event_state = _dict(event_state)
@@ -535,10 +598,16 @@ def build_tf_skinny_snapshot(
     decision_dist_atr = None
     if dp is not None and last_close is not None and atr and atr > 0:
         decision_dist_atr = (dp - last_close) / atr
+    asof_ts = snapshot.get("asof") or last.get("ts")
+    staleness_sec = _seconds_between(decision_ts, asof_ts)
+    tf_sec = _tf_to_seconds(tf)
+    is_stale = bool(staleness_sec is not None and tf_sec is not None and staleness_sec > max(tf_sec * 2, 300))
 
     return {
         "tf": tf,
-        "asof": snapshot.get("asof") or last.get("ts"),
+        "asof": asof_ts,
+        "staleness_sec": staleness_sec,
+        "is_stale": is_stale,
         "last_candle": _extract_last_candle(last),
         "decision_context": {
             "price": _round(dp),
@@ -552,13 +621,83 @@ def build_tf_skinny_snapshot(
         "atr_buffers": _atr_buffers(atr),
         "liquidity": _extract_liquidity(snapshot, atr),
         "structural_levels": _extract_structural_levels(snapshot, atr),
-        "fvgs": _extract_top_fvgs(snapshot, tf=tf, asof_ts=snapshot.get("asof") or last.get("ts"), atr=atr),
+        "fvgs": _extract_top_fvgs(
+            snapshot,
+            tf=tf,
+            asof_ts=asof_ts,
+            atr=atr,
+            limit_each_side=fvg_limit_each_side,
+        ),
         "volume_profile": _extract_vp(snapshot, atr),
         "events": {
             "latest": _extract_latest_events(event_state),
             "active_trackers": _extract_active_trackers(event_state),
             "recent": _extract_recent_events(event_state),
         },
+    }
+
+
+def build_weekly_macro_context(
+    *,
+    weekly_snapshot: Optional[Dict[str, Any]],
+    decision_price: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    snap = _dict(weekly_snapshot)
+    if not snap:
+        return None
+
+    last = _dict(snap.get("last_candle"))
+    momentum = _extract_momentum(snap)
+    atr = _safe_float(momentum.get("atr"))
+    structure = _extract_structure(snap)
+    trend = _extract_trend(snap)
+    liquidity = _extract_liquidity(snap, atr)
+    structural_levels = _extract_structural_levels(snap, atr)
+    vp = _extract_vp(snap, atr, profile_names=("structural",))
+    fvg = _extract_top_fvgs(
+        snap,
+        tf=MACRO_WEEKLY_TF,
+        asof_ts=snap.get("asof") or last.get("ts"),
+        atr=atr,
+        limit_each_side=1,
+    )
+
+    dp = _safe_float(decision_price)
+    candidate_prices: List[float] = []
+    for obj in (
+        structural_levels.get("nearest_high_above"),
+        structural_levels.get("nearest_low_below"),
+        liquidity.get("nearest_clean_high"),
+        liquidity.get("nearest_clean_low"),
+    ):
+        p = _safe_float(_dict(obj).get("price"))
+        if p is not None:
+            candidate_prices.append(p)
+
+    nearest_dist_atr = None
+    if dp is not None and atr and atr > 0 and candidate_prices:
+        nearest_dist_atr = min(abs(dp - p) / atr for p in candidate_prices)
+
+    return {
+        "tf": MACRO_WEEKLY_TF,
+        "asof": snap.get("asof") or last.get("ts"),
+        "trend": trend,
+        "structure": {
+            "state": structure.get("state"),
+            "direction": structure.get("direction"),
+            "risk_tier": structure.get("risk_tier"),
+            "confidence": structure.get("confidence"),
+        },
+        "nearest_swing_high": structural_levels.get("nearest_high_above"),
+        "nearest_swing_low": structural_levels.get("nearest_low_below"),
+        "nearest_clean_high": liquidity.get("nearest_clean_high"),
+        "nearest_clean_low": liquidity.get("nearest_clean_low"),
+        "nearest_fvg": {
+            "bullish_below": _list(fvg.get("bullish_below"))[:1],
+            "bearish_above": _list(fvg.get("bearish_above"))[:1],
+        },
+        "nearest_vp": vp,
+        "distance_to_nearest_macro_level_atr": _round(nearest_dist_atr, 3),
     }
 
 
@@ -595,6 +734,7 @@ def build_snapshot_summary(tfs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
 
     total = bull + bear
     confidence = round((max(bull, bear) / total) * 100, 1) if total > 0 else 0.0
+    stale_tfs = [tf for tf, block in tfs.items() if bool(block.get("is_stale"))]
     return {
         "bias": bias,
         "bull_score": round(bull, 2),
@@ -602,6 +742,13 @@ def build_snapshot_summary(tfs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         "confidence": confidence,
         "notes": notes,
         "mtf_alignment": build_mtf_alignment(tfs),
+        "snapshot_health": {
+            "has_stale_tfs": bool(stale_tfs),
+            "stale_tfs": stale_tfs,
+            "max_tf_staleness_sec": max(
+                [_safe_int(_dict(block).get("staleness_sec"), 0) for block in tfs.values()] or [0]
+            ),
+        },
     }
 
 
@@ -660,6 +807,7 @@ def build_gpt_skinny_snapshot(
     live_ts: Optional[str] = None,
     decision_ts: Optional[str] = None,
     include_tfs: Optional[List[str]] = None,
+    fvg_limit_each_side: int = 2,
 ) -> Dict[str, Any]:
     include_tfs = include_tfs or DEFAULT_INCLUDE_TFS
     spot_events_by_tf = spot_events_by_tf or {}
@@ -677,13 +825,27 @@ def build_gpt_skinny_snapshot(
         snap = snapshots_by_tf.get(tf)
         if not isinstance(snap, dict):
             continue
-        tfs[tf] = build_tf_skinny_snapshot(tf=tf, snapshot=snap, event_state=spot_events_by_tf.get(tf) or {}, decision_price=dp)
+        tfs[tf] = build_tf_skinny_snapshot(
+            tf=tf,
+            snapshot=snap,
+            event_state=spot_events_by_tf.get(tf) or {},
+            decision_price=dp,
+            decision_ts=decision.get("decision_ts"),
+            fvg_limit_each_side=fvg_limit_each_side,
+        )
 
     return {
         "schema": "gpt_skinny_snapshot_v1",
         "symbol": str(symbol or "").upper(),
         "created_at": decision.get("decision_ts") or _now_utc_iso(),
         "decision": decision,
+        "market_context": build_market_context(decision.get("decision_ts")),
+        "macro": {
+            "weekly": build_weekly_macro_context(
+                weekly_snapshot=snapshots_by_tf.get(MACRO_WEEKLY_TF),
+                decision_price=dp,
+            )
+        },
         "summary": build_snapshot_summary(tfs),
         "tfs": tfs,
     }
@@ -699,6 +861,7 @@ def build_gpt_strategy_input(
     live_ts: Optional[str] = None,
     decision_ts: Optional[str] = None,
     include_tfs: Optional[List[str]] = None,
+    fvg_limit_each_side: int = 2,
 ) -> Dict[str, Any]:
     return {
         "market": build_gpt_skinny_snapshot(
@@ -709,6 +872,7 @@ def build_gpt_strategy_input(
             live_ts=live_ts,
             decision_ts=decision_ts,
             include_tfs=include_tfs,
+            fvg_limit_each_side=fvg_limit_each_side,
         ),
         "active_setups": active_setups or [],
     }
