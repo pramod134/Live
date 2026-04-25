@@ -104,46 +104,60 @@ def _compute_macd(
     Returns a dict of single values (last value of each).
     If not enough data, values may be None.
     """
-    if len(closes) < max(fast_length, slow_length, signal_length) + 5:
+    min_len = slow_length + signal_length
+    if len(closes) < min_len:
         # Not enough history for a meaningful MACD
         return {
             "macd_fast": None,
             "macd_slow": None,
+            "macd_line": None,
             "macd_signal": None,
             "macd_hist": None,
+            "macd_hist_slope_3": None,
         }
 
-    fast = _ema(closes, fast_length)
-    slow = _ema(closes, slow_length)
-    if fast is None or slow is None:
+    fast_series: List[Optional[float]] = []
+    slow_series: List[Optional[float]] = []
+    macd_series: List[float] = []
+
+    for i in range(len(closes)):
+        sub = closes[: i + 1]
+        fast = _ema(sub, fast_length)
+        slow = _ema(sub, slow_length)
+        fast_series.append(fast)
+        slow_series.append(slow)
+
+        if fast is not None and slow is not None:
+            macd_series.append(fast - slow)
+
+    if not macd_series or len(macd_series) < signal_length:
         return {
-            "macd_fast": None,
-            "macd_slow": None,
+            "macd_fast": fast_series[-1],
+            "macd_slow": slow_series[-1],
+            "macd_line": None,
             "macd_signal": None,
             "macd_hist": None,
+            "macd_hist_slope_3": None,
         }
 
-    macd_line = fast - slow
+    macd_line = macd_series[-1]
+    signal = _ema(macd_series, signal_length)
+    hist = macd_line - signal if signal is not None else None
 
-    # For the signal line, we really should compute EMA of the MACD series.
-    # For simplicity, approximate it by EMA of closes with the same length offset by macd_line.
-    # Later, if needed, this can be made more precise by building a full MACD series.
-    # For now, keep it lightweight and robust.
-    # ----
-    # To avoid heavy recompute, treat current macd_line as the only sample and return signal=None
-    # when we don't have enough history. We'll just use macd_line / hist for now.
-    signal = None
-    hist = None
-    # If we wanted a very rough "signal", we could just say signal == macd_line.
-    # But that would make hist=0, which is not useful. So we keep signal/hist None
-    # until we implement a proper MACD series calculation.
-    # This keeps the structure in place for future refinement.
+    macd_hist_slope_3 = None
+    if hist is not None and len(macd_series) >= signal_length + 3:
+        prev_signal = _ema(macd_series[:-3], signal_length)
+        if prev_signal is not None:
+            prev_hist = macd_series[-4] - prev_signal
+            macd_hist_slope_3 = hist - prev_hist
 
     return {
-        "macd_fast": fast,
-        "macd_slow": slow,
+        "macd_fast": fast_series[-1],
+        "macd_slow": slow_series[-1],
+        "macd_line": macd_line,
         "macd_signal": signal,
         "macd_hist": hist,
+        "macd_hist_slope_3": macd_hist_slope_3,
     }
 
 
@@ -262,8 +276,10 @@ def _build_momentum_block(
     macd_vals = _compute_macd(closes)
     macd_fast = macd_vals.get("macd_fast")
     macd_slow = macd_vals.get("macd_slow")
+    macd_line = macd_vals.get("macd_line")
     macd_signal = macd_vals.get("macd_signal")
     macd_hist = macd_vals.get("macd_hist")
+    macd_hist_slope_3 = macd_vals.get("macd_hist_slope_3")
 
     macd_hist_norm: Optional[float] = None
     if macd_hist is not None and atr and atr > 0:
@@ -284,8 +300,10 @@ def _build_momentum_block(
         "mom_exhaustion": mom_exhaustion,
         "macd_fast": macd_fast,
         "macd_slow": macd_slow,
+        "macd_line": macd_line,
         "macd_signal": macd_signal,
         "macd_hist": macd_hist,
+        "macd_hist_slope_3": macd_hist_slope_3,
         "macd_hist_norm": macd_hist_norm,
         "atr_for_norm": atr,
         "last_close": last_close,
