@@ -58,6 +58,8 @@ def compute_structure_state_post(
     mom_regime = momentum.get("mom_regime")
     mom_strength = momentum.get("mom_strength")
     mom_exhaustion = bool(momentum.get("mom_exhaustion"))
+    macd_hist = _safe_float(momentum.get("macd_hist"))
+    macd_hist_slope_3 = _safe_float(momentum.get("macd_hist_slope_3"))
 
     htf_bias = htf.get("bias")
     vwap_ext = vwap.get("extended_flag")
@@ -145,6 +147,41 @@ def compute_structure_state_post(
         else:
             confidence -= 10
             tags.append("volume_absorption")
+
+    # MACD confirmation (lightweight, non-invasive)
+    if direction == "bullish":
+        if macd_hist is not None:
+            if macd_hist > 0:
+                confidence += 5
+                tags.append("macd_confirmed")
+            else:
+                confidence -= 5
+                tags.append("macd_not_confirmed")
+
+        if macd_hist_slope_3 is not None:
+            if macd_hist_slope_3 > 0:
+                confidence += 5
+                tags.append("macd_improving")
+            elif macd_hist_slope_3 < 0:
+                confidence -= 5
+                tags.append("macd_fading")
+
+    elif direction == "bearish":
+        if macd_hist is not None:
+            if macd_hist < 0:
+                confidence += 5
+                tags.append("macd_confirmed")
+            else:
+                confidence -= 5
+                tags.append("macd_not_confirmed")
+
+        if macd_hist_slope_3 is not None:
+            if macd_hist_slope_3 < 0:
+                confidence += 5
+                tags.append("macd_improving")
+            elif macd_hist_slope_3 > 0:
+                confidence -= 5
+                tags.append("macd_fading")
 
     confidence = max(0, min(100, int(round(confidence))))
 

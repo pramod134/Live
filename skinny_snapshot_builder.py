@@ -305,6 +305,9 @@ def _extract_momentum(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "mom_slope_3": _round(m.get("mom_slope_3"), 3),
         "mom_exhaustion": m.get("mom_exhaustion"),
         "atr": _round(m.get("atr_for_norm")),
+        "macd_line": _round(m.get("macd_line"), 5),
+        "macd_hist": _round(m.get("macd_hist"), 5),
+        "macd_hist_slope_3": _round(m.get("macd_hist_slope_3"), 5),
     }
 
 
