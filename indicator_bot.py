@@ -19,6 +19,7 @@ from post_indicator import compute_post_indicators
 
 from strategies import evaluate_strategies
 from skinny_snapshot_builder import build_gpt_strategy_input
+from db_worker import db_upsert_skinny_snapshot
 
 from liquidity_pool_builder import build_liquidity_pool
 
@@ -1146,6 +1147,7 @@ class IndicatorBot:
         self._fixed_window_default: int = max(0, int(os.getenv("INDICATOR_FIXED_CANDLES", "0") or "0"))
         self._fixed_window_by_tf: Dict[str, int] = {}
         self._strategy_runtime_by_symbol: Dict[str, Dict[str, Any]] = {}
+        self._skinny_live_start_written: set[str] = set()
         for tf in SUPPORTED_TFS:
             env_name = f"INDICATOR_FIXED_CANDLES_{tf.upper()}"
             raw = os.getenv(env_name)
@@ -1180,6 +1182,42 @@ class IndicatorBot:
             "run_strategy": bool(run_strategy),
             "selected_strategy": str(selected_strategy or "").strip() or None,
         }
+
+    def _build_symbol_skinny_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        sym = (symbol or "").upper()
+        if not sym:
+            return None
+
+        snap_map = self.last_snapshots.get(sym, {}) or {}
+        if not isinstance(snap_map, dict) or not snap_map:
+            return None
+
+        try:
+            return build_gpt_strategy_input(
+                symbol=sym,
+                snapshots_by_tf=snap_map,
+                spot_events_by_tf=self.last_events_state.get(sym, {}) or {},
+                active_setups=[],
+                live_price=None,
+                live_ts=None,
+            )
+        except Exception:
+            return None
+
+    async def _write_skinny_snapshot(self, symbol: str, mode: str) -> None:
+        skinny_snapshot = self._build_symbol_skinny_snapshot(symbol)
+        if skinny_snapshot is None:
+            return
+
+        try:
+            await asyncio.to_thread(
+                db_upsert_skinny_snapshot,
+                symbol=symbol,
+                mode=mode,
+                snapshot=skinny_snapshot,
+            )
+        except Exception:
+            pass
 
     def _window_candles(self, timeframe: str, candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self._candle_window_mode != "fixed":
@@ -1323,6 +1361,11 @@ class IndicatorBot:
         except Exception as e:
             pass
             # print(f"[INDICATOR_BOT][DIAG] bootstrap liquidity pool build failed: {e}")
+
+        # Live bootstrap snapshot only. Simulation remains DB-silent here.
+        if not self.sim_mode:
+            await self._write_skinny_snapshot(sym, "live_start")
+            self._skinny_live_start_written.add(sym)
 
     async def flush_tick_tf(self, symbol: str) -> None:
         """
@@ -1521,6 +1564,8 @@ class IndicatorBot:
                 events_active=state.get("events_active") or {},
                 events_recent=state.get("events_recent") or [],
             )
+
+        await self._write_skinny_snapshot(sym, "sim")
 
 
 
@@ -1900,6 +1945,13 @@ class IndicatorBot:
                 #     f"[INDICATORS] Updated {sym_upper} {tf} "
                 #     f"(ts={ts_dt.isoformat()}, trend={trend.get('state')})"
                 # )
+
+            if not self.sim_mode:
+                if sym_upper not in self._skinny_live_start_written:
+                    await self._write_skinny_snapshot(sym_upper, "live_start")
+                    self._skinny_live_start_written.add(sym_upper)
+
+                await self._write_skinny_snapshot(sym_upper, "live")
     
             # ---------------- FVG POOL (all TFs -> one symbol-level latest pool) ----------------
             try:
