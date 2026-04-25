@@ -1,5 +1,6 @@
 import os
 import json
+import datetime as dt
 from typing import Any
 
 import httpx
@@ -115,6 +116,131 @@ def db_insert_raw(
         "status_code": None,
         "attempts": 3,
         "error": "unknown insert failure",
+    }
+
+
+def db_upsert_skinny_snapshot(
+    *,
+    symbol: str,
+    mode: str,
+    snapshot: dict,
+    log_label: str = "SKINNY_SNAPSHOT",
+    returning: str = "minimal",
+) -> dict:
+    """
+    Upsert one combined symbol-level skinny snapshot.
+
+    Expected table:
+      public.skinny_snapshots
+
+    Conflict key:
+      (symbol, mode)
+    """
+    if not isinstance(snapshot, dict):
+        return {
+            "success": False,
+            "status_code": None,
+            "error": "snapshot must be a dict",
+        }
+
+    sym = str(symbol or "").upper().strip()
+    write_mode = str(mode or "").strip()
+    if not sym or not write_mode:
+        return {
+            "success": False,
+            "status_code": None,
+            "error": "symbol and mode are required",
+        }
+
+    base_url, key = _db_env()
+    endpoint = f"{base_url.rstrip('/')}/rest/v1/skinny_snapshots"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": f"resolution=merge-duplicates,return={returning}",
+    }
+    params = {
+        "on_conflict": "symbol,mode",
+    }
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    payload = {
+        "symbol": sym,
+        "mode": write_mode,
+        "asof": now_iso,
+        "snapshot": snapshot,
+        "created_at": now_iso,
+    }
+
+    print(
+        f"[{log_label}][DB_WRITE] action=upsert table=skinny_snapshots "
+        f"symbol={sym} mode={write_mode}"
+    )
+
+    last_error_payload = None
+    for attempt in range(1, 4):
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    endpoint,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                )
+
+            response.raise_for_status()
+
+            print(
+                f"[{log_label}][DB_APPLIED] action=upsert table=skinny_snapshots "
+                f"symbol={sym} mode={write_mode} attempt={attempt}"
+            )
+
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "attempts": attempt,
+                "data": response.json() if response.text else None,
+                "error": None,
+            }
+
+        except httpx.HTTPStatusError as e:
+            response = e.response
+            try:
+                error_body: Any = response.json() if response is not None and response.text else None
+            except Exception:
+                error_body = response.text if response is not None else str(e)
+
+            last_error_payload = {
+                "success": False,
+                "status_code": response.status_code if response is not None else None,
+                "attempts": attempt,
+                "error": error_body,
+            }
+
+            print(
+                f"[{log_label}][DB_ERROR] action=upsert table=skinny_snapshots "
+                f"symbol={sym} mode={write_mode} attempt={attempt} "
+                f"status={response.status_code if response is not None else 'unknown'} "
+                f"error={json.dumps(error_body, default=str, sort_keys=True)}"
+            )
+
+        except Exception as e:
+            last_error_payload = {
+                "success": False,
+                "status_code": None,
+                "attempts": attempt,
+                "error": str(e),
+            }
+            print(
+                f"[{log_label}][DB_ERROR] action=upsert table=skinny_snapshots "
+                f"symbol={sym} mode={write_mode} attempt={attempt} error={str(e)}"
+            )
+
+    return last_error_payload or {
+        "success": False,
+        "status_code": None,
+        "attempts": 3,
+        "error": "unknown skinny snapshot upsert failure",
     }
 
 
