@@ -1166,16 +1166,20 @@ class IndicatorBot:
     ) -> None:
         try:
             trade_ideas = find_trade_ideas(strategy_context)
+            print(
+                f"[RAW_TRADE_IDEAS][DEBUG] generated={len(trade_ideas) if isinstance(trade_ideas, list) else 'invalid'}"
+            )
             if not isinstance(trade_ideas, list) or not trade_ideas:
                 return
 
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 db_insert_raw_trade_ideas,
                 snapshot_id=(strategy_context.get("market") or {}).get("created_at"),
                 trade_ideas=trade_ideas,
             )
+            print(f"[RAW_TRADE_IDEAS][DEBUG] db_result={json.dumps(result, default=str)}")
         except Exception as e:
-            logger.debug("raw trade idea store failed: %s", e)
+            print(f"[RAW_TRADE_IDEAS][ERROR] {e}")
 
     # ------------------------------------------------------------------ #
     # Simulation entrypoints (sim_worker depends on these)
