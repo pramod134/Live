@@ -244,6 +244,72 @@ def db_upsert_skinny_snapshot(
     }
 
 
+def db_insert_raw_trade_ideas(
+    *,
+    snapshot_id: str | None,
+    trade_ideas: list[dict],
+    log_label: str = "RAW_TRADE_IDEAS",
+) -> dict:
+    """
+    Insert raw trade_finder output into public.raw_trade_ideas.
+
+    Rules:
+    - stores exactly what trade_finder emitted
+    - no dedupe
+    - no filtering
+    - no activation
+    - no execution
+    """
+    rows = []
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    for trade in trade_ideas or []:
+        if not isinstance(trade, dict):
+            continue
+
+        rows.append(
+            {
+                "snapshot_id": snapshot_id,
+                "symbol": trade.get("symbol"),
+                "horizon": trade.get("horizon"),
+                "tf": trade.get("tf"),
+                "trade_type": trade.get("trade_type"),
+                "strategy": trade.get("strategy"),
+                "direction": trade.get("direction"),
+                "score": trade.get("score"),
+                "confidence": trade.get("confidence"),
+                "risk_tier": trade.get("risk_tier"),
+                "rr_to_tp1": trade.get("rr_to_tp1"),
+                "entry_zone_json": trade.get("entry_zone") or {},
+                "stop_json": trade.get("stop") or {},
+                "targets_json": trade.get("targets") or [],
+                "tags_json": trade.get("tags") or [],
+                "warnings_json": trade.get("warnings") or [],
+                "source_tfs_json": trade.get("source_tfs") or [],
+                "reason": trade.get("reason"),
+                "raw_json": trade,
+                "created_at": now_iso,
+            }
+        )
+
+    if not rows:
+        return {
+            "success": True,
+            "status_code": None,
+            "attempts": 0,
+            "data": None,
+            "error": None,
+            "rows": 0,
+        }
+
+    return db_insert_raw(
+        table="raw_trade_ideas",
+        payload=rows,
+        returning="minimal",
+        log_label=log_label,
+    )
+
+
 def active_trades_checker(
     *,
     strategy: str,
