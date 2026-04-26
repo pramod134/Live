@@ -11,6 +11,10 @@ HORIZONS = {
     "scalp": ["5m", "3m", "1m"],
 }
 
+# --- V3 constants ---
+BREAKOUT_EXPANSION_THRESHOLD = 1.5
+VWAP_PULLBACK_ATR_FACTOR = 0.25
+
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -347,68 +351,169 @@ def _continuation_ideas(market: Dict[str, Any], horizon: str, tf: str, tf_data: 
     direction = structure.get("direction")
     fvgs = tf_data.get("fvgs") or {}
 
-    if "bos" not in state and "choch" not in state:
-        return ideas
+    # allow multi-strategy continuation (no early return)
+    momentum = tf_data.get("momentum") or {}
+    vwap = tf_data.get("vwap") or {}
+    vol_ctx = tf_data.get("vol_context") or {}
 
-    strategy = "choch_fvg_pullback" if "choch" in state else "bos_fvg_pullback"
+    if "bos" in state or "choch" in state:
+        strategy = "choch_fvg_pullback" if "choch" in state else "bos_fvg_pullback"
+        all_fvgs = [f for f in _all_fvgs(fvgs) if not _is_stale_fvg(f)]
 
-    all_fvgs = [f for f in _all_fvgs(fvgs) if not _is_stale_fvg(f)]
+        if direction == "bullish":
+            long_fvgs = [f for f in all_fvgs if f.get("direction") == "bull"]
 
-    if direction == "bullish":
-        long_fvgs = [f for f in all_fvgs if f.get("direction") == "bull"]
+            for fvg in long_fvgs:
+                low = _level_price(fvg.get("low"))
+                high = _level_price(fvg.get("high"))
+                stop = _safe_float((fvg.get("low") or {}).get("long_stop_ref"))
+                if low is None or high is None or stop is None:
+                    continue
 
-        for fvg in long_fvgs:
-            low = _level_price(fvg.get("low"))
-            high = _level_price(fvg.get("high"))
-            stop = _safe_float((fvg.get("low") or {}).get("long_stop_ref"))
-            if low is None or high is None or stop is None:
-                continue
+                trade = _make_trade(
+                    market=market,
+                    tf=tf,
+                    tf_data=tf_data,
+                    horizon=horizon,
+                    trade_type="continuation",
+                    strategy=strategy,
+                    direction="long",
+                    entry_low=low,
+                    entry_high=high,
+                    stop_price=stop,
+                    entry_source=f"{tf}_bullish_fvg",
+                    stop_source="fvg_low_normal_atr_buffer",
+                    extra_reasons=[f"{tf} bullish structure with bullish FVG pullback"],
+                )
+                if trade:
+                    ideas.append(trade)
 
+        elif direction == "bearish":
+            short_fvgs = [f for f in all_fvgs if f.get("direction") == "bear"]
+
+            for fvg in short_fvgs:
+                low = _level_price(fvg.get("low"))
+                high = _level_price(fvg.get("high"))
+                stop = _safe_float((fvg.get("high") or {}).get("short_stop_ref"))
+                if low is None or high is None or stop is None:
+                    continue
+
+                trade = _make_trade(
+                    market=market,
+                    tf=tf,
+                    tf_data=tf_data,
+                    horizon=horizon,
+                    trade_type="continuation",
+                    strategy=strategy,
+                    direction="short",
+                    entry_low=low,
+                    entry_high=high,
+                    stop_price=stop,
+                    entry_source=f"{tf}_bearish_fvg",
+                    stop_source="fvg_high_normal_atr_buffer",
+                    extra_reasons=[f"{tf} bearish structure with bearish FVG pullback"],
+                )
+                if trade:
+                    ideas.append(trade)
+
+    # --- VWAP CONTINUATION ---
+    vwap_price = _safe_float(vwap.get("vwap"))
+    side = vwap.get("side")
+    atr = _safe_float(momentum.get("atr")) or 0.0
+
+    if vwap_price is not None and atr > 0:
+        band = atr * VWAP_PULLBACK_ATR_FACTOR
+
+        if direction == "bullish" and side == "above":
             trade = _make_trade(
                 market=market,
                 tf=tf,
                 tf_data=tf_data,
                 horizon=horizon,
                 trade_type="continuation",
-                strategy=strategy,
+                strategy="vwap_continuation",
                 direction="long",
-                entry_low=low,
-                entry_high=high,
-                stop_price=stop,
-                entry_source=f"{tf}_bullish_fvg",
-                stop_source="fvg_low_normal_atr_buffer",
-                extra_reasons=[f"{tf} bullish structure with bullish FVG pullback"],
+                entry_low=vwap_price - band,
+                entry_high=vwap_price + band,
+                stop_price=vwap_price - atr,
+                entry_source=f"{tf}_vwap_pullback",
+                stop_source="vwap_minus_atr",
+                extra_tags=["vwap_hold"],
+                extra_reasons=[f"{tf} bullish structure holding above VWAP"],
             )
             if trade:
                 ideas.append(trade)
 
-    elif direction == "bearish":
-        short_fvgs = [f for f in all_fvgs if f.get("direction") == "bear"]
-
-        for fvg in short_fvgs:
-            low = _level_price(fvg.get("low"))
-            high = _level_price(fvg.get("high"))
-            stop = _safe_float((fvg.get("high") or {}).get("short_stop_ref"))
-            if low is None or high is None or stop is None:
-                continue
-
+        if direction == "bearish" and side == "below":
             trade = _make_trade(
                 market=market,
                 tf=tf,
                 tf_data=tf_data,
                 horizon=horizon,
                 trade_type="continuation",
-                strategy=strategy,
+                strategy="vwap_continuation",
                 direction="short",
-                entry_low=low,
-                entry_high=high,
-                stop_price=stop,
-                entry_source=f"{tf}_bearish_fvg",
-                stop_source="fvg_high_normal_atr_buffer",
-                extra_reasons=[f"{tf} bearish structure with bearish FVG pullback"],
+                entry_low=vwap_price - band,
+                entry_high=vwap_price + band,
+                stop_price=vwap_price + atr,
+                entry_source=f"{tf}_vwap_pullback",
+                stop_source="vwap_plus_atr",
+                extra_tags=["vwap_hold"],
+                extra_reasons=[f"{tf} bearish structure holding below VWAP"],
             )
             if trade:
                 ideas.append(trade)
+
+    # --- BREAKOUT CONTINUATION ---
+    expansion = _safe_float(vol_ctx.get("bar_range_vs_atr"))
+    atr = _safe_float(momentum.get("atr")) or 0.0
+
+    if expansion is not None and expansion > BREAKOUT_EXPANSION_THRESHOLD and atr > 0:
+        structural = tf_data.get("structural_levels") or {}
+
+        if direction == "bullish":
+            level = _level_price(structural.get("nearest_high_above"))
+            if level:
+                trade = _make_trade(
+                    market=market,
+                    tf=tf,
+                    tf_data=tf_data,
+                    horizon=horizon,
+                    trade_type="continuation",
+                    strategy="breakout_continuation",
+                    direction="long",
+                    entry_low=level,
+                    entry_high=level + atr,
+                    stop_price=level - atr,
+                    entry_source=f"{tf}_breakout",
+                    stop_source="breakout_minus_atr",
+                    extra_tags=["breakout", "expansion"],
+                    extra_reasons=[f"{tf} bullish breakout with expansion"],
+                )
+                if trade:
+                    ideas.append(trade)
+
+        if direction == "bearish":
+            level = _level_price(structural.get("nearest_low_below"))
+            if level:
+                trade = _make_trade(
+                    market=market,
+                    tf=tf,
+                    tf_data=tf_data,
+                    horizon=horizon,
+                    trade_type="continuation",
+                    strategy="breakout_continuation",
+                    direction="short",
+                    entry_low=level - atr,
+                    entry_high=level,
+                    stop_price=level + atr,
+                    entry_source=f"{tf}_breakdown",
+                    stop_source="breakout_plus_atr",
+                    extra_tags=["breakout", "expansion"],
+                    extra_reasons=[f"{tf} bearish breakdown with expansion"],
+                )
+                if trade:
+                    ideas.append(trade)
 
     return ideas
 
@@ -419,6 +524,7 @@ def _reversal_ideas(market: Dict[str, Any], horizon: str, tf: str, tf_data: Dict
     liquidity = tf_data.get("liquidity") or {}
     momentum = tf_data.get("momentum") or {}
     atr_buffers = tf_data.get("atr_buffers") or {}
+    structure = tf_data.get("structure") or {}
 
     normal_atr = _safe_float(atr_buffers.get("normal")) or _safe_float(momentum.get("atr")) or 0.0
     macd_slope = _safe_float(momentum.get("macd_hist_slope_3"))
@@ -469,6 +575,103 @@ def _reversal_ideas(market: Dict[str, Any], horizon: str, tf: str, tf_data: Dict
             )
             if trade:
                 ideas.append(trade)
+
+    # --- VWAP RECLAIM REVERSAL ---
+    vwap = tf_data.get("vwap") or {}
+    vwap_price = _safe_float(vwap.get("vwap"))
+    side = vwap.get("side")
+    atr = _safe_float(momentum.get("atr")) or 0.0
+
+    if vwap_price is not None and atr > 0:
+        if side == "below" and structure.get("direction") == "bullish":
+            trade = _make_trade(
+                market=market,
+                tf=tf,
+                tf_data=tf_data,
+                horizon=horizon,
+                trade_type="reversal",
+                strategy="vwap_reclaim_reversal",
+                direction="long",
+                entry_low=vwap_price - (atr * 0.25),
+                entry_high=vwap_price + (atr * 0.25),
+                stop_price=vwap_price - atr,
+                entry_source=f"{tf}_vwap_reclaim",
+                stop_source="vwap_minus_atr",
+                extra_tags=["vwap_reclaim"],
+                extra_reasons=[f"{tf} reclaiming VWAP with bullish structure"],
+            )
+            if trade:
+                ideas.append(trade)
+
+        if side == "above" and structure.get("direction") == "bearish":
+            trade = _make_trade(
+                market=market,
+                tf=tf,
+                tf_data=tf_data,
+                horizon=horizon,
+                trade_type="reversal",
+                strategy="vwap_reclaim_reversal",
+                direction="short",
+                entry_low=vwap_price - (atr * 0.25),
+                entry_high=vwap_price + (atr * 0.25),
+                stop_price=vwap_price + atr,
+                entry_source=f"{tf}_vwap_reclaim",
+                stop_source="vwap_plus_atr",
+                extra_tags=["vwap_reclaim"],
+                extra_reasons=[f"{tf} losing VWAP with bearish structure"],
+            )
+            if trade:
+                ideas.append(trade)
+
+    # --- MOMENTUM EXHAUSTION REVERSAL ---
+    if momentum.get("mom_exhaustion"):
+        structural = tf_data.get("structural_levels") or {}
+        atr = _safe_float(momentum.get("atr")) or 0.0
+
+        if atr > 0:
+            if structure.get("direction") == "bullish":
+                level = _level_price(structural.get("nearest_high_above"))
+                if level is not None:
+                    trade = _make_trade(
+                        market=market,
+                        tf=tf,
+                        tf_data=tf_data,
+                        horizon=horizon,
+                        trade_type="reversal",
+                        strategy="exhaustion_reversal",
+                        direction="short",
+                        entry_low=level - (atr * 0.25),
+                        entry_high=level,
+                        stop_price=level + atr,
+                        entry_source=f"{tf}_exhaustion",
+                        stop_source="structure_high_plus_atr",
+                        extra_tags=["exhaustion"],
+                        extra_reasons=[f"{tf} bullish exhaustion detected"],
+                    )
+                    if trade:
+                        ideas.append(trade)
+
+            if structure.get("direction") == "bearish":
+                level = _level_price(structural.get("nearest_low_below"))
+                if level is not None:
+                    trade = _make_trade(
+                        market=market,
+                        tf=tf,
+                        tf_data=tf_data,
+                        horizon=horizon,
+                        trade_type="reversal",
+                        strategy="exhaustion_reversal",
+                        direction="long",
+                        entry_low=level,
+                        entry_high=level + (atr * 0.25),
+                        stop_price=level - atr,
+                        entry_source=f"{tf}_exhaustion",
+                        stop_source="structure_low_minus_atr",
+                        extra_tags=["exhaustion"],
+                        extra_reasons=[f"{tf} bearish exhaustion detected"],
+                    )
+                    if trade:
+                        ideas.append(trade)
 
     return ideas
 
