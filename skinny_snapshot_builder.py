@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_INCLUDE_TFS = ["1d", "1h", "15m", "5m", "3m", "1m"]
@@ -201,7 +202,7 @@ def build_market_context(decision_ts: Optional[str]) -> Dict[str, Any]:
             "near_close": False,
         }
 
-    et = t.astimezone(dt.timezone(dt.timedelta(hours=-4)))
+    et = t.astimezone(ZoneInfo("America/New_York"))
     mins = et.hour * 60 + et.minute
     rth_open = 9 * 60 + 30
     rth_close = 16 * 60
@@ -713,16 +714,15 @@ def build_snapshot_summary(tfs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     for tf, block in tfs.items():
         w = weights.get(tf, 1.0)
         structure = _dict(block.get("structure"))
-        trend = _dict(block.get("trend"))
         direction = structure.get("direction")
         action = structure.get("action")
         confidence = _safe_float(structure.get("confidence"), 50.0) or 50.0
         score = w * max(0.25, confidence / 50.0)
 
-        if direction == "bullish" or trend.get("state") == "bull":
+        if direction == "bullish":
             bull += score
             notes.append(f"{tf}:bullish:{action or 'na'}")
-        elif direction == "bearish" or trend.get("state") == "bear":
+        elif direction == "bearish":
             bear += score
             notes.append(f"{tf}:bearish:{action or 'na'}")
         else:
