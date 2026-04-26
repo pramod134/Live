@@ -5,8 +5,6 @@ import json
 import logging
 import datetime as dt
 import time
-import sqlite3
-import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -20,9 +18,8 @@ from post_indicator import compute_post_indicators
 
 from strategies import evaluate_strategies
 from skinny_snapshot_builder import build_gpt_strategy_input
-from db_worker import db_upsert_skinny_snapshot
+from db_worker import db_upsert_skinny_snapshot, db_insert_raw_trade_ideas
 from trade_finder import find_trade_ideas
-from trade_idea_store import ensure_raw_trade_ideas_table, store_raw_trade_ideas
 
 from liquidity_pool_builder import build_liquidity_pool
 
@@ -1151,10 +1148,6 @@ class IndicatorBot:
         self._fixed_window_by_tf: Dict[str, int] = {}
         self._strategy_runtime_by_symbol: Dict[str, Dict[str, Any]] = {}
         self._skinny_live_start_written: set[str] = set()
-        self.trade_idea_db_path = os.getenv("TRADE_IDEA_DB_PATH", "trade_ideas.db")
-        self.trade_idea_conn = sqlite3.connect(self.trade_idea_db_path, check_same_thread=False)
-        self._trade_idea_conn_lock = threading.Lock()
-        ensure_raw_trade_ideas_table(self.trade_idea_conn)
         for tf in SUPPORTED_TFS:
             env_name = f"INDICATOR_FIXED_CANDLES_{tf.upper()}"
             raw = os.getenv(env_name)
@@ -1176,17 +1169,11 @@ class IndicatorBot:
             if not isinstance(trade_ideas, list) or not trade_ideas:
                 return
 
-            snapshot_id = ((strategy_context.get("market") or {}).get("created_at"))
-
-            def _write() -> None:
-                with self._trade_idea_conn_lock:
-                    store_raw_trade_ideas(
-                        self.trade_idea_conn,
-                        snapshot_id=snapshot_id,
-                        trade_ideas=trade_ideas,
-                    )
-
-            await asyncio.to_thread(_write)
+            await asyncio.to_thread(
+                db_insert_raw_trade_ideas,
+                snapshot_id=(strategy_context.get("market") or {}).get("created_at"),
+                trade_ideas=trade_ideas,
+            )
         except Exception as e:
             logger.debug("raw trade idea store failed: %s", e)
 
