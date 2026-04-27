@@ -270,9 +270,13 @@ def _make_trade(
     stop_price: float,
     entry_source: str,
     stop_source: str,
+    tf_timestamp: Optional[str] = None,
     extra_tags: Optional[List[str]] = None,
     extra_reasons: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
+    if tf_timestamp is None:
+        tf_timestamp = tf_data.get("asof") or tf_data.get("last_ts")
+
     target_obj = _build_targets(
         market=market,
         tf_data=tf_data,
@@ -316,6 +320,7 @@ def _make_trade(
         "symbol": market.get("symbol"),
         "horizon": horizon,
         "tf": tf,
+        "tf_timestamp": tf_timestamp,
         "trade_type": trade_type,
         "strategy": strategy,
         "direction": direction,
