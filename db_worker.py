@@ -53,10 +53,15 @@ def db_insert_raw(
 
     row_count = len(payload) if isinstance(payload, list) else 1
 
-    print(
-        f"[{log_label}][DB_WRITE] action=insert table={table} rows={row_count} "
-        f"payload={json.dumps(payload, default=str, sort_keys=True)}"
-    )
+    if log_label != "RAW_TRADE_IDEAS":
+        print(
+            f"[{log_label}][DB_WRITE] action=insert table={table} rows={row_count} "
+            f"payload={json.dumps(payload, default=str, sort_keys=True)}"
+        )
+    # print(
+    #     f"[{log_label}][DB_WRITE] action=insert table={table} rows={row_count} "
+    #     f"payload={json.dumps(payload, default=str, sort_keys=True)}"
+    # )
 
     last_error_payload = None
 
@@ -273,6 +278,7 @@ def db_insert_raw_trade_ideas(
                 "symbol": trade.get("symbol"),
                 "horizon": trade.get("horizon"),
                 "tf": trade.get("tf"),
+                "tf_timestamp": trade.get("tf_timestamp"),
                 "trade_type": trade.get("trade_type"),
                 "strategy": trade.get("strategy"),
                 "direction": trade.get("direction"),
