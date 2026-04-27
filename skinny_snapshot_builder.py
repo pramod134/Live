@@ -100,6 +100,20 @@ def _tf_to_seconds(tf: Any) -> Optional[int]:
     return None
 
 
+def _candle_close_ts(open_ts: Any, tf: Any) -> Optional[str]:
+    """
+    Convert candle-open timestamp to candle-close timestamp.
+
+    Candle data stores ts/asof as candle start time. Snapshot timing logic
+    should use close time for freshness and age calculations.
+    """
+    t = _iso_to_dt(open_ts)
+    tf_sec = _tf_to_seconds(tf)
+    if not t or not tf_sec:
+        return str(open_ts) if open_ts else None
+    return (t + dt.timedelta(seconds=tf_sec)).isoformat()
+
+
 def _atr_buffers(atr: Optional[float]) -> Dict[str, Optional[float]]:
     a = _safe_float(atr)
     if a is None or a <= 0:
@@ -603,13 +617,15 @@ def build_tf_skinny_snapshot(
     if dp is not None and last_close is not None and atr and atr > 0:
         decision_dist_atr = (dp - last_close) / atr
     asof_ts = snapshot.get("asof") or last.get("ts")
-    staleness_sec = _seconds_between(decision_ts, asof_ts)
+    timing_asof_ts = _candle_close_ts(asof_ts, tf)
+    staleness_sec = _seconds_between(decision_ts, timing_asof_ts)
     tf_sec = _tf_to_seconds(tf)
     is_stale = bool(staleness_sec is not None and tf_sec is not None and staleness_sec > max(tf_sec * 2, 300))
 
     return {
         "tf": tf,
         "asof": asof_ts,
+        "timing_asof": timing_asof_ts,
         "staleness_sec": staleness_sec,
         "is_stale": is_stale,
         "last_candle": _extract_last_candle(last),
@@ -628,7 +644,7 @@ def build_tf_skinny_snapshot(
         "fvgs": _extract_top_fvgs(
             snapshot,
             tf=tf,
-            asof_ts=asof_ts,
+            asof_ts=timing_asof_ts,
             atr=atr,
             limit_each_side=fvg_limit_each_side,
         ),
@@ -658,10 +674,13 @@ def build_weekly_macro_context(
     liquidity = _extract_liquidity(snap, atr)
     structural_levels = _extract_structural_levels(snap, atr)
     vp = _extract_vp(snap, atr, profile_names=("structural",))
+    macro_asof_ts = snap.get("asof") or last.get("ts")
+    macro_timing_asof_ts = _candle_close_ts(macro_asof_ts, MACRO_WEEKLY_TF)
+
     fvg = _extract_top_fvgs(
         snap,
         tf=MACRO_WEEKLY_TF,
-        asof_ts=snap.get("asof") or last.get("ts"),
+        asof_ts=macro_timing_asof_ts,
         atr=atr,
         limit_each_side=1,
     )
@@ -684,7 +703,8 @@ def build_weekly_macro_context(
 
     return {
         "tf": MACRO_WEEKLY_TF,
-        "asof": snap.get("asof") or last.get("ts"),
+        "asof": macro_asof_ts,
+        "timing_asof": macro_timing_asof_ts,
         "trend": trend,
         "structure": {
             "state": structure.get("state"),

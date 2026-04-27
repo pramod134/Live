@@ -2,6 +2,7 @@
 # Output: raw trade ideas list
 # No DB writes. No execution. No dedupe. No mutation.
 
+import datetime as dt
 from typing import Any, Dict, List, Optional
 
 
@@ -31,6 +32,39 @@ def _get_market(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tf(market: Dict[str, Any], tf: str) -> Dict[str, Any]:
     return (market.get("tfs") or {}).get(tf) or {}
+
+
+def _tf_delta(tf: str) -> Optional[dt.timedelta]:
+    tf = str(tf or "").strip().lower()
+    if tf.endswith("m"):
+        return dt.timedelta(minutes=int(tf[:-1]))
+    if tf.endswith("h"):
+        return dt.timedelta(hours=int(tf[:-1]))
+    if tf.endswith("d"):
+        return dt.timedelta(days=int(tf[:-1]))
+    return None
+
+
+def _candle_close_timestamp(open_ts: Any, tf: str) -> Optional[str]:
+    if open_ts is None:
+        return None
+
+    delta = _tf_delta(tf)
+    if delta is None:
+        return str(open_ts)
+
+    try:
+        if isinstance(open_ts, dt.datetime):
+            ts = open_ts
+        else:
+            ts = dt.datetime.fromisoformat(str(open_ts).replace("Z", "+00:00"))
+
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+
+        return (ts + delta).isoformat()
+    except Exception:
+        return str(open_ts)
 
 
 def _level_price(obj: Any) -> Optional[float]:
@@ -275,7 +309,10 @@ def _make_trade(
     extra_reasons: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     if tf_timestamp is None:
-        tf_timestamp = tf_data.get("asof") or tf_data.get("last_ts")
+        tf_timestamp = _candle_close_timestamp(
+            tf_data.get("asof") or tf_data.get("last_ts"),
+            tf,
+        )
 
     target_obj = _build_targets(
         market=market,
