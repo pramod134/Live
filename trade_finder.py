@@ -685,8 +685,9 @@ def find_trade_ideas(skinny_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
             tf_data = _tf(market, tf)
             if not tf_data:
                 continue
-            if tf_data.get("is_stale"):
-                continue
+            # TEMP: allow stale TFs during sim/testing
+            # if tf_data.get("is_stale"):
+            #     continue
 
             ideas.extend(_continuation_ideas(market, horizon, tf, tf_data))
             ideas.extend(_reversal_ideas(market, horizon, tf, tf_data))
