@@ -693,3 +693,62 @@ def find_trade_ideas(skinny_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     ideas.sort(key=lambda x: x.get("score", 0), reverse=True)
     return ideas
+
+
+def diagnose_trade_idea_flow(skinny_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return lightweight diagnostics for why trade ideas may be empty.
+    Safe/pure helper: no mutation, no I/O.
+    """
+    market = _get_market(skinny_snapshot)
+    stats: Dict[str, Any] = {
+        "symbol": market.get("symbol"),
+        "evaluated_tf_slots": 0,
+        "missing_tf_slots": 0,
+        "stale_tf_slots": 0,
+        "fresh_tf_slots": 0,
+        "trade_ideas_count": 0,
+        "target_sources_by_tf": {},
+        "targetless_tf_slots": 0,
+    }
+
+    for horizon, tfs in HORIZONS.items():
+        for tf in tfs:
+            stats["evaluated_tf_slots"] += 1
+            tf_data = _tf(market, tf)
+            if not tf_data:
+                stats["missing_tf_slots"] += 1
+                continue
+            if tf_data.get("is_stale"):
+                stats["stale_tf_slots"] += 1
+                continue
+
+            stats["fresh_tf_slots"] += 1
+            target_probe_long = _build_targets(
+                market=market,
+                tf_data=tf_data,
+                direction="long",
+                horizon=horizon,
+            )
+            target_probe_short = _build_targets(
+                market=market,
+                tf_data=tf_data,
+                direction="short",
+                horizon=horizon,
+            )
+
+            long_target_count = len(target_probe_long.get("targets") or [])
+            short_target_count = len(target_probe_short.get("targets") or [])
+            stats["target_sources_by_tf"][tf] = {
+                "horizon": horizon,
+                "long_targets": long_target_count,
+                "short_targets": short_target_count,
+            }
+            if long_target_count == 0 and short_target_count == 0:
+                stats["targetless_tf_slots"] += 1
+
+            candidates = _continuation_ideas(market, horizon, tf, tf_data)
+            candidates.extend(_reversal_ideas(market, horizon, tf, tf_data))
+            stats["trade_ideas_count"] += len(candidates)
+
+    return stats
