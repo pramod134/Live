@@ -16,6 +16,14 @@ HORIZONS = {
 BREAKOUT_EXPANSION_THRESHOLD = 1.5
 VWAP_PULLBACK_ATR_FACTOR = 0.25
 
+# --- Quality scoring ---
+VP_CONFLUENCE_WEIGHTS = {
+    "structural": 8,
+    "rolling_60": 5,
+    "session": 3,
+}
+VP_CONFLUENCE_MAX_BONUS = 10
+
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -78,6 +86,10 @@ def _is_stale_fvg(fvg: Dict[str, Any]) -> bool:
     return freshness == "stale" or freshness == "invalid_future"
 
 
+def _is_filled_fvg(fvg: Dict[str, Any]) -> bool:
+    return bool(fvg.get("filled_ts"))
+
+
 def _all_fvgs(fvgs: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for bucket in ("bullish_below", "bearish_above"):
@@ -103,6 +115,64 @@ def _add_target(targets: List[Dict[str, Any]], price: Any, source: str, directio
             "direction": direction,
         }
     )
+
+
+def _filter_invalid_targets(
+    *,
+    targets: List[Dict[str, Any]],
+    entry_low: float,
+    entry_high: float,
+    tf_data: Dict[str, Any],
+    direction: str,
+) -> List[Dict[str, Any]]:
+    floor = _safe_float((tf_data.get("atr_buffers") or {}).get("normal")) or 0.0
+    valid: List[Dict[str, Any]] = []
+
+    for t in targets:
+        p = _safe_float(t.get("price"))
+        if p is None:
+            continue
+
+        if direction == "long":
+            if p <= entry_low:
+                continue
+            if floor > 0 and (p - entry_low) < floor:
+                continue
+
+        elif direction == "short":
+            if p >= entry_high:
+                continue
+            if floor > 0 and (entry_high - p) < floor:
+                continue
+
+        valid.append(t)
+
+    return valid
+
+
+def _range_overlaps(a_low: float, a_high: float, b_low: Any, b_high: Any) -> bool:
+    bl = _safe_float(b_low)
+    bh = _safe_float(b_high)
+    if bl is None or bh is None:
+        return False
+    lo = min(bl, bh)
+    hi = max(bl, bh)
+    return max(float(a_low), lo) <= min(float(a_high), hi)
+
+
+def _price_in_entry(price: Any, entry_low: float, entry_high: float, buffer: float = 0.0) -> bool:
+    p = _safe_float(price)
+    if p is None:
+        return False
+    return (float(entry_low) - buffer) <= p <= (float(entry_high) + buffer)
+
+
+def _vp_node_overlaps_entry(node: Any, entry_low: float, entry_high: float, buffer: float) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if _range_overlaps(entry_low - buffer, entry_high + buffer, node.get("low"), node.get("high")):
+        return True
+    return _price_in_entry((node.get("poc") or {}).get("price"), entry_low, entry_high, buffer)
 
 
 def _build_targets(
@@ -281,6 +351,45 @@ def _score_trade(
                 score -= 15
                 warnings.append("rr_poor")
 
+    vp = tf_data.get("volume_profile") or {}
+    atr_tight = _safe_float((tf_data.get("atr_buffers") or {}).get("tight")) or 0.0
+    confluence_bonus = 0
+    confluence_profiles: List[str] = []
+
+    for profile_name, weight in VP_CONFLUENCE_WEIGHTS.items():
+        profile = vp.get(profile_name) or {}
+        matched = False
+
+        if _vp_node_overlaps_entry(profile.get("hvn_here"), entry_low, entry_high, atr_tight):
+            matched = True
+
+        if not matched:
+            poc_price = (profile.get("poc") or {}).get("price")
+            if _price_in_entry(poc_price, entry_low, entry_high, atr_tight):
+                matched = True
+
+        if matched:
+            confluence_bonus += weight
+            confluence_profiles.append(profile_name)
+
+    if confluence_bonus > 0:
+        applied_bonus = min(VP_CONFLUENCE_MAX_BONUS, confluence_bonus)
+        score += applied_bonus
+        tags.append("vp_confluence")
+        tags.append("hvn_confluence")
+
+        if "structural" in confluence_profiles:
+            tags.append("structural_hvn_confluence")
+        if "rolling_60" in confluence_profiles:
+            tags.append("rolling_60_hvn_confluence")
+        if "session" in confluence_profiles:
+            tags.append("session_hvn_confluence")
+
+        reasons.append(
+            "entry overlaps volume-profile confluence: "
+            + ",".join(sorted(set(confluence_profiles)))
+        )
+
     return {
         "score": max(0, min(100, int(round(score)))),
         "tags": sorted(set(tags)),
@@ -322,6 +431,16 @@ def _make_trade(
     )
 
     targets = target_obj["targets"]
+    if not targets:
+        return None
+
+    targets = _filter_invalid_targets(
+        targets=targets,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        tf_data=tf_data,
+        direction=direction,
+    )
     if not targets:
         return None
 
@@ -400,7 +519,7 @@ def _continuation_ideas(market: Dict[str, Any], horizon: str, tf: str, tf_data: 
 
     if "bos" in state or "choch" in state:
         strategy = "choch_fvg_pullback" if "choch" in state else "bos_fvg_pullback"
-        all_fvgs = [f for f in _all_fvgs(fvgs) if not _is_stale_fvg(f)]
+        all_fvgs = [f for f in _all_fvgs(fvgs) if not _is_filled_fvg(f)]
 
         if direction == "bullish":
             long_fvgs = [f for f in all_fvgs if f.get("direction") == "bull"]
