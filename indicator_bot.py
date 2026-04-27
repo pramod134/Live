@@ -19,7 +19,7 @@ from post_indicator import compute_post_indicators
 from strategies import evaluate_strategies
 from skinny_snapshot_builder import build_gpt_strategy_input
 from db_worker import db_upsert_skinny_snapshot, db_insert_raw_trade_ideas
-from trade_finder import find_trade_ideas
+from trade_finder import diagnose_trade_idea_flow, find_trade_ideas
 
 from liquidity_pool_builder import build_liquidity_pool
 
@@ -1170,6 +1170,8 @@ class IndicatorBot:
                 f"[RAW_TRADE_IDEAS][DEBUG] generated={len(trade_ideas) if isinstance(trade_ideas, list) else 'invalid'}"
             )
             if not isinstance(trade_ideas, list) or not trade_ideas:
+                diag = diagnose_trade_idea_flow(strategy_context)
+                print(f"[RAW_TRADE_IDEAS][DEBUG] diagnostics={json.dumps(diag, default=str)}")
                 return
 
             result = await asyncio.to_thread(
