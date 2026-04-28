@@ -1,6 +1,7 @@
 # Input: skinny snapshot dict
 # Output: raw trade ideas list
 # No DB writes. No execution. No dedupe. No mutation.
+# Applies final same-batch output cleanup after raw ideas are generated.
 
 import datetime as dt
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,9 @@ HORIZONS = {
 # --- V3 constants ---
 BREAKOUT_EXPANSION_THRESHOLD = 1.5
 VWAP_PULLBACK_ATR_FACTOR = 0.25
+BATCH_LEVEL_TOLERANCE = 0.10
+MIN_TP_ROOM = 0.50
+MIN_CONFIDENCE_FOR_TIGHT_TP = 50
 
 # --- Quality scoring ---
 VP_CONFLUENCE_WEIGHTS = {
@@ -148,6 +152,152 @@ def _filter_invalid_targets(
         valid.append(t)
 
     return valid
+
+
+def _tp1_price(trade: Dict[str, Any]) -> Optional[float]:
+    targets = trade.get("targets") or []
+    if not targets or not isinstance(targets[0], dict):
+        return None
+    return _safe_float(targets[0].get("price"))
+
+
+def _trade_geometry(trade: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    entry = trade.get("entry_zone") or {}
+    stop = trade.get("stop") or {}
+
+    entry_low = _safe_float(entry.get("low"))
+    entry_high = _safe_float(entry.get("high"))
+    stop_price = _safe_float(stop.get("price"))
+    tp1 = _tp1_price(trade)
+
+    if entry_low is None or entry_high is None or stop_price is None or tp1 is None:
+        return None
+
+    return {
+        "entry_low": float(entry_low),
+        "entry_high": float(entry_high),
+        "stop": float(stop_price),
+        "tp1": float(tp1),
+    }
+
+
+def _same_batch_merge_scope(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return (
+        a.get("symbol") == b.get("symbol")
+        and a.get("tf") == b.get("tf")
+        and a.get("direction") == b.get("direction")
+    )
+
+
+def _geometry_within_tolerance(
+    a: Dict[str, Any],
+    b: Dict[str, Any],
+    *,
+    tolerance: float = BATCH_LEVEL_TOLERANCE,
+) -> bool:
+    ga = _trade_geometry(a)
+    gb = _trade_geometry(b)
+    if ga is None or gb is None:
+        return False
+
+    return (
+        abs(ga["entry_low"] - gb["entry_low"]) <= tolerance
+        and abs(ga["entry_high"] - gb["entry_high"]) <= tolerance
+        and abs(ga["stop"] - gb["stop"]) <= tolerance
+        and abs(ga["tp1"] - gb["tp1"]) <= tolerance
+    )
+
+
+def _merge_same_batch_trades(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Same-batch fuzzy merge.
+    Keep latest trade metadata, broaden entry zone, append strategy names into
+    the existing strategy field, and combine lightweight metadata.
+    """
+    merged = dict(new)
+
+    old_entry = old.get("entry_zone") or {}
+    new_entry = new.get("entry_zone") or {}
+    old_low = _safe_float(old_entry.get("low"))
+    old_high = _safe_float(old_entry.get("high"))
+    new_low = _safe_float(new_entry.get("low"))
+    new_high = _safe_float(new_entry.get("high"))
+
+    entry = dict(new_entry)
+    if old_low is not None and new_low is not None:
+        entry["low"] = round(min(float(old_low), float(new_low)), 4)
+    if old_high is not None and new_high is not None:
+        entry["high"] = round(max(float(old_high), float(new_high)), 4)
+    merged["entry_zone"] = entry
+
+    merged["merge_count"] = int(old.get("merge_count") or 1) + int(new.get("merge_count") or 1)
+
+    old_horizons = old.get("horizons") or [old.get("horizon")]
+    new_horizons = new.get("horizons") or [new.get("horizon")]
+    merged["horizons"] = sorted({h for h in old_horizons + new_horizons if h})
+
+    old_strategy_value = old.get("strategy")
+    new_strategy_value = new.get("strategy")
+    old_strategies = str(old_strategy_value).split("+") if old_strategy_value else []
+    new_strategies = str(new_strategy_value).split("+") if new_strategy_value else []
+    strategy_list = sorted({s for s in old_strategies + new_strategies if s})
+    merged["strategy"] = "+".join(strategy_list)
+
+    merged["tags"] = sorted(set((old.get("tags") or []) + (new.get("tags") or [])))
+    merged["warnings"] = sorted(set((old.get("warnings") or []) + (new.get("warnings") or [])))
+
+    return merged
+
+
+def _same_batch_fuzzy_merge(ideas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+
+    for idea in ideas:
+        matched_idx = None
+        for idx, existing in enumerate(merged):
+            if not _same_batch_merge_scope(existing, idea):
+                continue
+            if _geometry_within_tolerance(existing, idea):
+                matched_idx = idx
+                break
+
+        if matched_idx is None:
+            merged.append(idea)
+        else:
+            merged[matched_idx] = _merge_same_batch_trades(merged[matched_idx], idea)
+
+    return merged
+
+
+def _passes_tp_room_confidence_filter(trade: Dict[str, Any]) -> bool:
+    entry = trade.get("entry_zone") or {}
+    direction = trade.get("direction")
+    tp1 = _tp1_price(trade)
+    confidence = _safe_float(trade.get("confidence")) or 0.0
+
+    if tp1 is None:
+        return False
+
+    if direction == "long":
+        entry_low = _safe_float(entry.get("low"))
+        if entry_low is None:
+            return False
+        room = float(tp1) - float(entry_low)
+
+    elif direction == "short":
+        entry_high = _safe_float(entry.get("high"))
+        if entry_high is None:
+            return False
+        room = float(entry_high) - float(tp1)
+
+    else:
+        return False
+
+    return not (room < MIN_TP_ROOM and confidence < MIN_CONFIDENCE_FOR_TIGHT_TP)
+
+
+def _filter_low_quality_tight_tp_ideas(ideas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [idea for idea in ideas if _passes_tp_room_confidence_filter(idea)]
 
 
 def _range_overlaps(a_low: float, a_high: float, b_low: Any, b_high: Any) -> bool:
@@ -853,6 +1003,8 @@ def find_trade_ideas(skinny_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
             ideas.extend(_continuation_ideas(market, horizon, tf, tf_data))
             ideas.extend(_reversal_ideas(market, horizon, tf, tf_data))
 
+    ideas = _same_batch_fuzzy_merge(ideas)
+    ideas = _filter_low_quality_tight_tp_ideas(ideas)
     ideas.sort(key=lambda x: x.get("score", 0), reverse=True)
     return ideas
 
